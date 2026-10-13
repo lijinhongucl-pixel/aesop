@@ -2,7 +2,7 @@
 
 **What this file is:** The live durable checkpoint that Aesop itself uses during its own `/buildsystem` loop. It records the current system version, architectural decisions, known limitations, and the next milestone. This is not historical archive; it is read by the orchestrator to understand operational state.
 
-**Current Version:** v0.8.0 (tagged + released 2026-09-11; npm latest 0.8.0). HEAD: 4837ae60 (2026-10-05); 73 commits since v0.8.0.
+**Current Version:** v0.9.1 (tagged + released 2026-10-10; npm latest 0.9.0 - 0.9.1 publish blocked on 401). HEAD: 4b39eaeb (2026-10-13); 6 commits since v0.9.1.
 
 ## CURRENT (2026-10-13T18:32Z) - FLAIR NOTICE LIVE; MAIN 5788da50; DRIFT GATE + TYPO PRS IN FLIGHT
 **Since 17:57Z:** PR #940 merged 18:22Z - Matt's hooks flair notice is live on main as a scoped known-issue line below the Aesop Kernel positioning (verified by reading origin/main:README.md). PR #939 was a DUPLICATE no-op merge (empty diff) caused by the orchestrator's own leftover `push && gh pr create` chain resurrecting the auto-deleted docs/rebrand-corrections branch after #938 merged - harmless to content, recorded as memory `never-push-to-pr-automerge-may-take`. Memory `read-last-two-instructions-literally` records the headline/referent hallucination episode and Matt's ruling that outreach, titles and headlines are his decisions. STATE.md 17:57Z block's placeholder timestamp was corrected (f4cc51d3) and pushed to backup/state-checkpoint-20261013.
