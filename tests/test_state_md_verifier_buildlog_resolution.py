@@ -139,6 +139,50 @@ class TestBuildlogResolution(unittest.TestCase):
                 "A state file with CURRENT header but no BUILDLOG should not silently pass."
             )
 
+    def test_verify_buildlog_drift_detects_single_hyphen_checkpoint_form(self):
+        """Guardrail #6 must accept both checkpoint-line forms:
+        - Triple-hyphen form: '--- 2026-10-10T02:59:39Z [checkpoint:afk] ...'
+        - Single-hyphen form: '- 2026-10-13T00:00Z [checkpoint] ...'
+
+        A checkpoint written with the single-hyphen form must be detected as
+        a CONTRADICTION when it is newer than STATE.md's CURRENT header.
+
+        Anti-vacuity: this test FAILS on the broken regex (which only matches
+        '---'), and PASSES on the fixed regex (which matches both '---' and '-').
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+
+            external_dir = tmpdir_path / "external_state"
+            external_dir.mkdir()
+
+            state_md_path = external_dir / "STATE.md"
+            buildlog_path = external_dir / "BUILDLOG.md"
+
+            # STATE.md with CURRENT header dated 2026-09-19 (old)
+            state_md_path.write_text(
+                "# State\n\n## CURRENT (2026-09-19 10:00:00)\n\nStale state.\n",
+                encoding='utf-8'
+            )
+
+            # BUILDLOG.md with checkpoint using SINGLE-HYPHEN form, dated 2026-10-13 (new)
+            buildlog_path.write_text(
+                "- 2026-10-13T00:00Z [checkpoint] Wave check\n",
+                encoding='utf-8'
+            )
+
+            # Verify the drift
+            findings = state_md_verifier.verify_buildlog_drift(state_md_path, buildlog_path)
+
+            # On broken code: findings will be empty or SKIP (single-hyphen not matched)
+            # On fixed code: findings contains a CONTRADICTION (2026-09-19 < 2026-10-13)
+            self.assertTrue(
+                any(f["status"] == "CONTRADICTION" for f in findings),
+                f"Expected CONTRADICTION but got: {findings}. "
+                f"Single-hyphen checkpoint '- 2026-10-13T00:00Z [checkpoint]' should be detected; "
+                f"it is newer than STATE.md (2026-09-19)."
+            )
+
 
 def suite():
     """Return test suite."""
@@ -146,6 +190,7 @@ def suite():
     suite.addTest(TestBuildlogResolution('test_explicit_state_md_finds_buildlog_in_same_directory'))
     suite.addTest(TestBuildlogResolution('test_verify_buildlog_drift_with_explicit_paths_contradicts'))
     suite.addTest(TestBuildlogResolution('test_verify_buildlog_drift_explicit_paths_missing_buildlog_fails_closed'))
+    suite.addTest(TestBuildlogResolution('test_verify_buildlog_drift_detects_single_hyphen_checkpoint_form'))
     return suite
 
 

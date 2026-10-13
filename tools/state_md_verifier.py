@@ -588,7 +588,7 @@ def verify_freshness_claims(claims, git_root):
 _DATE_RE = re.compile(r'(\d{4}-\d{2}-\d{2})')
 _TIME_RE = re.compile(r'[T ]~?(\d{2}):(\d{2})(?::(\d{2}))?')
 _CURRENT_HEADER_RE = re.compile(r'^## CURRENT \(([^)]*)\)', re.MULTILINE)
-_CHECKPOINT_LINE_RE = re.compile(r'^-{3,}\s+(\S+)\s+\[checkpoint(?::[^\]]+)?\]', re.MULTILINE)
+_CHECKPOINT_LINE_RE = re.compile(r'^-{1,3}\s+(\S+)\s+\[checkpoint(?::[^\]]+)?\]', re.MULTILINE)
 
 
 def extract_date_time(text):
