@@ -9,10 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
 - CI hardening: every GitHub Actions `uses:` pinned to a full commit SHA with a version comment; top-level `permissions: contents: read` in every workflow, with write grants moved to the jobs that need them; npm pinned to 12.2.0 in publish.yml (the version the last green publish used).
+- Docs: corrected dependency and Python-floor claims to match the repo (no runtime npm dependencies; CI floor Python 3.11; PyYAML/cryptography/playwright/opentelemetry/anthropic/pyflakes listed in new `pyproject.toml`) and added a prompt-injection threat model to `docs/ARCHITECTURE.md`.
+
+### Added
 
 - Added `tools/goal_state.py` (orchestrator GOAL as append-only `goal_set` events in the event store) and `tools/boot_state.py` (one deterministic, byte-capped boot brief from the store, STATE.md ACTIVE, BUILDLOG tail and git; exits 2 on an unreadable store).
-- Docs: corrected dependency and Python-floor claims to match the repo (no runtime npm dependencies; CI floor Python 3.11; PyYAML/cryptography/playwright/opentelemetry/anthropic/pyflakes listed in new `pyproject.toml`) and added a prompt-injection threat model to `docs/ARCHITECTURE.md`.
+- **Boot brief from the event store**: `tools/boot_state.py` projects one canonical boot brief from the event store, with `tools/goal_state.py` for goal events (#1053).
 
 ## [0.10.0] - 2026-10-15
 
@@ -41,7 +46,6 @@ corrections, and test-isolation race fixes. 71 PRs merged since v0.9.2 (2026-10-
 - **Other**: merge-train origin writes gated and pushed branches cleaned up on failure (#1013); `ingest_task_events` quarantines glued torn lines instead of wedging (#1016); box-wide halt sentinel honored from any checkout and fail-closed on halt-check errors (#957); claim-read errors fail closed (#990); `auto_merge` scoped verdict and bench API runner honor the offline seam and require `--confirm-spend` (#995); baseline `--json` protocol answers the portability ratchet only, 69s to 1s (#1024).
 
 ### Added
-- **Boot brief from the event store**: `tools/boot_state.py` projects one canonical boot brief from the event store, with `tools/goal_state.py` for goal events (#1053).
 - **Pre-push G6 subprocess ratchet**: the pre-push hook runs the G6 subprocess ratchet exactly as `ci.yml` does (#1037).
 - **Linux-shape native leg** runs Node and Shell suites through the isolation tripwire (#1010).
 - **Tripwire coverage**: `test_isolation_tripwire` armed around `test:py` and the CI Python shards (#974).
@@ -331,7 +335,6 @@ a gate that fails closed.
 - `test_hook_preflight` is wired but does not execute; full rewrite needed to fix `tmp_path` NameError and add coverage.
 - `test_agent_detail_roundtrip` fix landed (#668); re-verification under ci_shard_runner context still pending.
 
-## [0.7.2] - 2026-07-31
 ## [0.7.2] - 2026-07-31
 
 ### Fixed
