@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Added `tools/goal_state.py` (orchestrator GOAL as append-only `goal_set` events in the event store) and `tools/boot_state.py` (one deterministic, byte-capped boot brief from the store, STATE.md ACTIVE, BUILDLOG tail and git; exits 2 on an unreadable store).
+- Added supply-chain hygiene: `requirements.lock.txt` (hash-locked runtime deps from `requirements.txt` via `pip-compile --generate-hashes`, verified with `--require-hashes`), `.github/workflows/scorecard.yml` (OpenSSF Scorecard) and `.github/workflows/codeql.yml` (CodeQL for javascript-typescript and python), all actions SHA-pinned.
 
 ## [0.10.0] - 2026-10-15
 
