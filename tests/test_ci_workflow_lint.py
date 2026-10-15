@@ -12,7 +12,9 @@ Fixture-root isolated tests using tempfile to avoid pollution.
 
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1182,3 +1184,120 @@ class TestActionlintIntegration(unittest.TestCase):
             capture_output=True, encoding="utf-8", errors="replace", env=env,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+class WindowsAggregatorBehaviourTest(unittest.TestCase):
+    """Drive the REAL `windows` aggregator run-script from .github/workflows/ci.yml.
+
+    Regression (main CI run 38538275152, 2026-10-14, event=schedule, HEAD=docs-only #942):
+    docs-only-gate succeeded with is_docs_only=true, so windows-shard's own if: skipped it,
+    and the aggregator treated that deliberate skip as a failure (exit 1). The only skip
+    the aggregator may accept is the docs-only-gate success + is_docs_only=true path.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+    STEP_NAME = "Resolve Windows run result"
+    EXPR_RE = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
+
+    def _aggregator_script(self):
+        import yaml
+        text = self.WORKFLOW.read_text(encoding="utf-8").replace("\r\n", "\n")
+        jobs = yaml.safe_load(text)["jobs"]
+        for step in jobs["windows"]["steps"]:
+            if step.get("name") == self.STEP_NAME:
+                return step["run"]
+        self.fail("aggregator step not found in ci.yml")
+
+    @staticmethod
+    def _working_bash():
+        """Return a bash that actually executes a command, or None.
+
+        On Windows, shutil.which("bash") can resolve to the WSL launcher in System32,
+        which fails with "Windows Subsystem for Linux has no installed distributions".
+        Probe each candidate and keep the first one that really runs.
+        """
+        candidates = [shutil.which("bash"),
+                      r"C:\Program Files\Git\bin\bash.exe",
+                      r"C:\Program Files\Git\usr\bin\bash.exe"]
+        for candidate in candidates:
+            if not candidate or not os.path.exists(candidate):
+                continue
+            try:
+                probe = subprocess.run(
+                    [candidate, "-c", "echo aesop-bash-probe"],
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                )
+            except OSError:
+                continue
+            if probe.returncode == 0 and "aesop-bash-probe" in probe.stdout:
+                return candidate
+        return None
+
+    def test_wsl_launcher_without_distro_is_not_chosen(self):
+        # Windows shard regression: bash on PATH was the WSL launcher with no distro.
+        # The probe must reject it (non-zero exit, no probe echo) and never pick it.
+        from unittest import mock
+        wsl = r"C:\Windows\System32\bash.exe"
+        wsl_error = subprocess.CompletedProcess(
+            [wsl], 1,
+            stdout="",
+            stderr="W i n d o w s  S u b s y s t e m  f o r  L i n u x  h a s  n o  i n s t a l l e d  d i s t r i b u t i o n s .",
+        )
+        with mock.patch("shutil.which", return_value=wsl), \
+                mock.patch("os.path.exists", return_value=True), \
+                mock.patch("subprocess.run", return_value=wsl_error):
+            self.assertIsNone(self._working_bash())
+
+    def _run(self, event, windows_touched, shard_result, docs_result, is_docs_only):
+        bash = self._working_bash()
+        if bash is None:
+            self.skipTest("no working bash interpreter on this host")
+        values = {
+            "github.event_name": event,
+            "needs.windows-sensitive-paths.outputs.windows_touched": windows_touched,
+            "needs.windows-shard.result": shard_result,
+            "needs.docs-only-gate.result": docs_result,
+            "needs.docs-only-gate.outputs.is_docs_only": is_docs_only,
+        }
+
+        def render(match):
+            key = match.group(1).strip()
+            self.assertIn(key, values, f"unexpected expression in aggregator: {key}")
+            return values[key]
+
+        script = self.EXPR_RE.sub(render, self._aggregator_script())
+        proc = subprocess.run(
+            [bash, "-c", script], cwd=str(self.ROOT),
+            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def test_schedule_docs_only_skip_is_green(self):
+        # The exact main-CI failure: docs-only HEAD on a schedule run.
+        rc, out = self._run("schedule", "true", "skipped", "success", "true")
+        self.assertEqual(rc, 0, out)
+
+    def test_schedule_windows_success_is_green(self):
+        rc, out = self._run("schedule", "true", "success", "success", "false")
+        self.assertEqual(rc, 0, out)
+
+    def test_schedule_windows_failure_is_red(self):
+        rc, out = self._run("schedule", "true", "failure", "success", "false")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("One or more Windows shards failed", out)
+
+    def test_schedule_code_change_with_windows_skipped_is_red(self):
+        # Windows-sensitive code landed but windows-shard never ran: must not be green.
+        rc, out = self._run("schedule", "true", "skipped", "success", "false")
+        self.assertEqual(rc, 1, out)
+
+    def test_upstream_docs_gate_failed_skip_is_red(self):
+        # Fail-closed: a skip caused by docs-only-gate not concluding success is a
+        # Windows run that never happened, not a deliberate docs-only skip.
+        rc, out = self._run("schedule", "true", "skipped", "failure", "")
+        self.assertEqual(rc, 1, out)
+
+    def test_pull_request_untouched_skip_is_green(self):
+        rc, out = self._run("pull_request", "false", "skipped", "success", "true")
+        self.assertEqual(rc, 0, out)
