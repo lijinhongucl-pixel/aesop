@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Receipt honesty: a scoped push that selects zero python shards now posts check-run conclusion `neutral` instead of `success`; red stays `failure` and the verifier is unchanged (#1085).
 - CI hardening: every GitHub Actions `uses:` pinned to a full commit SHA with a version comment; top-level `permissions: contents: read` in every workflow, with write grants moved to the jobs that need them; npm pinned to 12.2.0 in publish.yml (the version the last green publish used).
 - Docs: `SECURITY.md` supported-versions table now lists 0.10.x (older lines not supported); `ui/README.md` Python floor and dependency statement aligned with the root README (Python 3.11+).
 
