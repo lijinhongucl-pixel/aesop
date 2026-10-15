@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Added `tools/goal_state.py` (orchestrator GOAL as append-only `goal_set` events in the event store) and `tools/boot_state.py` (one deterministic, byte-capped boot brief from the store, STATE.md ACTIVE, BUILDLOG tail and git; exits 2 on an unreadable store).
+- Added the refuted ledger: `docs/refuted.jsonl` (committed record of measured-and-killed ideas, gate-bounced claims and REFUTED lanes), `tools/refuted_ledger.py` (validate, add, stats, redact; fail-closed) and `docs/REFUTED.md`.
 
 ## [0.10.0] - 2026-10-15
 
