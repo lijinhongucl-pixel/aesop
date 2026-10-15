@@ -4,19 +4,22 @@
 
 **Current Version:** v0.9.1 (tag 5026195d, cut 2026-10-09; GitHub release published 2026-10-10; npm @matt82198/aesop 0.9.1; 40 PRs since v0.9.0). Previous: v0.9.0 (2026-10-07).
 
-## CI-TO-GREEN QUEUE (2026-10-15 ~13:40Z, ceiling checkpoint; BUILDLOG has the ledger)
+## CI-TO-GREEN QUEUE (2026-10-15 ~14:10Z, post-clear dispatch checkpoint; BUILDLOG has the ledger)
 
-- DONE: #1027 MERGED (d5f07bdf) doctor git-2.56 wording; main-full 38743443664 success. claude-config #20 #21 MERGED, brain ff-pulled. #1026 MERGED. Memory index OK (22983 B). conductor3 BUILDLOG rotated.
-- IN FLIGHT (verify by literal PR number before restating): C7 lane merging main into #1025 #1020 #1014 #1011 (github-agent sonnet); #1012 lane (python-pro sonnet); guard-fix lane fix/generated-path-guard-merge-carried (haiku, was waiting on checks); incidents lane fix/incidents-md-drift (haiku, incident-report-gate red on main, STATE defects 1-5).
-- LANE CLAIM, UNVERIFIED at ceiling (bind with gh pr view 1012 / 1029 first thing after clear): #1012 MERGED as 49d2c5c6 at head efb71b6a (3 symbols restored: _SCRUBBED_PART_ENV, scrubbed_part_env, TestMatrixPartEnvScrub; watcher loop bounded; pushed once with AESOP_ALLOW_GENERATED=1 for the new-tool INDEX.md case). Follow-up #1029 MERGED (docs/INCIDENTS.md regenerated), so incident-report-gate may already be green on main; the incidents lane must re-check before changing INCIDENTS.md and still fix defects 2-5. verify-receipt red from local shard failures (test_isolation_tripwire: ~/.claude/memory changed during run, i.e. memory keeper interference; unproven). Worktree aesop-wt-rcflush left in place.
-- LANE CLAIM, UNVERIFIED at ceiling (bind with gh pr view 1028 / 1030): guard fix #1028 MERGED as bc902245 (tools/generated_paths.py regen_matches_head: touched registered path allowed when regen in a throwaway HEAD worktree is byte-identical to HEAD blob; fails closed on any error; 6 new tests, anti-vacuity shown). #1030 MERGED (INCIDENTS.md regen dropped a row sourced from pre-squash 4bd101eb). Lane reports subprocess_guard --check RED on main: 11 SHELL_TRUE findings in tests/test_hs2_block_gate.py and tests/test_wave_cross_repo_ship.py (new queue item). Lane ran git fetch/worktree remove from the primary checkout cwd (disclosed; no files changed).
-- DISPATCH FIRST after clear (3 brain fixes, haiku lanes, all in worktrees, TDD + anti-vacuity, auto-merge, verify MERGED):
-  1. claude-scripts auto_clear.py (python-pro): `--check`/`--send --force` exit 2 "Cannot read context size from snapshot". Add fallback = same source as ~/.claude/hooks/main-context-ceiling.mjs (newest project transcript JSONL last usage object, same token formula); fail closed naming both paths tried. Prove with --check from the aesop root.
-  2. aesop hooks/pre-push-policy.sh (bash-pro): "Push to main/master is blocked by policy" fired on `git push origin HEAD:refs/heads/checkpoint/x` from local main. Judge the REMOTE ref from stdin, not the local branch. Tests in tests/test_pre_push_policy.sh: main->checkpoint allowed, feature->main blocked, main->main blocked.
-  3. claude-config hooks/main-context-ceiling.mjs (javascript-pro): at the ceiling it denies the read-only gh commands claim-binding.mjs requires, and also denies Agent dispatch, so the two hooks deadlock. Allowlist anchored read-only `gh pr view N`, `gh pr checks N`, `gh run view N`, `gh run list`; never merge/create/close/edit/rerun/api; chained commands all-allowed only. Update header doc (also add auto_clear.py from #21). Tests + _failclosed.
-- UNBLOCKED by #1028 (once bound): resume #1018 push and #997 merge-main.
-- BLOCKED: #1018 fixture fix is local only (5980725a in aesop-wt-1018, 11/11 tests) because generated-paths guard blocks merge-carried tools/INDEX.md. After guard fix merges: resume lane in wt-1018 to merge main + push.
-- QUEUED: #997 merge main after guard fix (windows red was C1). NEXT STEPS (a) receipts design after #1020 merges. Decide whether incident-report-gate should be required.
+- BOUND with gh at 14:05Z: #1012 MERGED 49d2c5c6, #1028 MERGED bc902245, #1029 MERGED 541157f7, #1030 MERGED 0fb23795 (= origin/main). main-full success on 541157f7; main-full on 0fb23795 in progress at bind. Earlier DONE: #1027 d5f07bdf, #1026, claude-config #20 #21.
+- Required checks on main (gh api branch protection): ci (0) ci (1) ci (2) ci (3), windows, pr-footprint-gate, pr-symbol-survival. verify-receipt is NOT required and is red on #1031 #1025 #1020 (base-trust problem; #1020 is its fix).
+- #1031 fix/incidents-md-drift (head f4f8c11c, auto-merge armed): only waiting on ci (0) at bind; expect MERGED without action.
+- The pre-clear C7 merge-main lane did NOT finish: #1025 #1020 #1014 #1011 were all mergeStateStatus DIRTY at bind. Re-dispatched as four separate github-agent haiku lanes (worktrees aesop-wt-1025/1020/1014/1011; three-way conflict resolution; regen for INDEX.md/INCIDENTS.md; push; auto-merge; verify MERGED).
+- DISPATCHED 14:05Z (10 haiku lanes total; verify each claim by literal PR number before restating):
+  1. claude-scripts fix/auto-clear-context-fallback (python-pro): auto_clear.py --check fallback to transcript JSONL, same formula as main-context-ceiling.mjs, fail closed naming both paths.
+  2. aesop fix/pre-push-policy-remote-ref (bash-pro): pre-push-policy.sh judges the REMOTE ref from stdin; tests main->checkpoint allowed, feature->main blocked, main->main blocked.
+  3. claude-config fix/main-context-ceiling-gh-readonly (javascript-pro): allowlist anchored read-only gh pr view/checks, gh run view/list; chained all-allowed only; auto_clear.py entry if #21 missed it; _failclosed coverage. Orchestrator ff-pulls ~/.claude after MERGED.
+  4. aesop fix/subprocess-guard-shell-true-tests (python-pro): 11 SHELL_TRUE findings in tests/test_hs2_block_gate.py + tests/test_wave_cross_repo_ship.py; no fitted green; lane also reports whether subprocess_guard --check is wired in CI/pre-push (wiring is a separate decision).
+  5. #1018 resume (github-agent): merge main in aesop-wt-1018, push 5980725a, auto-merge.
+  6. #997 resume (github-agent): merge main, push, report windows leg red diagnosis if still red.
+  7-10. #1025 #1020 #1014 #1011 merge-main lanes (above).
+- NEXT after fleet lands: ff-pull ~/.claude (lane 3) and ~/scripts (lane 1); decide subprocess_guard CI wiring from lane 4's finding; decide whether incident-report-gate should be required; receipts design after #1020 merges; run idle_tick when nothing else is actionable.
+- Note for hooks: dispatches to brain repos (claude-scripts, claude-config) are refused by the lane-contract hook unless the brief names C:/Users/Mattt/Desktop/aesop/LANE-CONTRACT.md; two briefs were resent with that line.
 
 ## CURRENT (2026-10-14 mid-wave checkpoint)
 
