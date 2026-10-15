@@ -996,9 +996,13 @@ check_symbol_survival() {
   #
   # Fail-open ONLY when there is no aesop tools/ checkout at all (the same
   # rule as every other gate); a present-but-missing script fails closed.
-  local aesop_root
+  # Base-pinned (same rule as every other gate): the tool runs from the origin/main
+  # gate copy, never the pushed tree. A PR that weakens the tool to exit 0 must not
+  # pass a lossy merge it is judged on (lens L2 F2, G13 not base-pinned).
+  local aesop_root gate_dir
   aesop_root=$(resolve_aesop_root)
-  local symbol_script="$aesop_root/tools/pr_symbol_survival_check.py"
+  gate_dir=$(gate_base_dir) || { gate_base_block "check_symbol_survival"; return 1; }
+  local symbol_script="$gate_dir/tools/pr_symbol_survival_check.py"
 
   local tool_status
   tool_status=$(gate_tool_status "$aesop_root" "$symbol_script")
@@ -3068,9 +3072,15 @@ GENPATHS
     git -C "$sym_repo" config user.name "Test User"
     git -C "$sym_repo" config core.autocrlf false
     printf 'def existing():\n    pass\n' > "$sym_repo/mod.py"
+    # The G13 tool is base-pinned: the hook runs origin/main's copy, so the trunk must
+    # carry it and origin/main must exist (gate_base_dir fails closed on a bare repo,
+    # which would make the BLOCK assertion pass for the wrong reason).
+    mkdir -p "$sym_repo/tools"
+    cp "$sym_real_root/tools/pr_symbol_survival_check.py" "$sym_repo/tools/"
     git -C "$sym_repo" add -A
     git -C "$sym_repo" commit -q -m base
     sym_base=$(git -C "$sym_repo" rev-parse HEAD)
+    git -C "$sym_repo" update-ref refs/remotes/origin/main "$sym_base"
 
     git -C "$sym_repo" checkout -q -b feature
     printf 'def existing():\n    pass\n\n\ndef alpha():\n    pass\n' > "$sym_repo/mod.py"
@@ -3091,10 +3101,15 @@ GENPATHS
       cd "$sym_repo" || exit 1
       export AESOP_ROOT="$sym_aesop_root"
       stdin_line="$sym_tip $sym_tip refs/heads/main $sym_base"
-      if printf '%s\n' "$stdin_line" | check_symbol_survival >/dev/null 2>&1; then
+      sym_block_out=$(printf '%s\n' "$stdin_line" | check_symbol_survival 2>&1)
+      if [ $? -eq 0 ]; then
         printf 'FAIL: check_symbol_survival should BLOCK a push whose merge dropped a branch symbol\n'
         exit 1
       fi
+      case "$sym_block_out" in
+        *MISSING*) ;;
+        *) printf 'FAIL: block did not come from the symbol-survival verdict (no MISSING): %s\n' "$sym_block_out"; exit 1 ;;
+      esac
 
       git checkout -q -b clean "$sym_base"
       printf 'def existing():\n    pass\n\n\ndef beta():\n    pass\n' > mod.py
