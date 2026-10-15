@@ -531,12 +531,10 @@ class AsciiScopeTest(unittest.TestCase):
     baselined file that became clean is a stale-entry finding.
     """
 
-    # Non-ASCII tools/*.py files when the ratchet was introduced (102), plus the
-    # 5 .github/workflows/*.yml files that already held non-ASCII when workflow
-    # YAML joined the scope on 2026-10-15 (ci 10, crossos-drift 3, main-full 3,
-    # publish 4, reproduce 2 = 22 characters, measured by _count_non_ascii).
-    # The baseline may shrink freely; raising this ceiling needs a measured reason.
-    BASELINE_CEILING = 107
+    # Non-ASCII tools/*.py files when the ratchet was introduced. The baseline
+    # may shrink freely; raising this ceiling needs a measured reason.
+    # (.github/workflows/*.yml is ASCII-clean and carries no baseline entries.)
+    BASELINE_CEILING = 102
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
