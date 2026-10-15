@@ -456,5 +456,97 @@ class TestCLI(unittest.TestCase):
             self.assertTrue((Path(td) / "CLAUDE.md").exists())
 
 
+def _git(cwd, *args):
+    """Run a git command in cwd and return its stripped stdout."""
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=60, check=True,
+    )
+    return result.stdout.strip()
+
+
+class TestPrePushHookScansPushedRange(unittest.TestCase):
+    """The installed pre-push hook must scan the pushed commit range, not only the index."""
+
+    BRANCH = "refs/heads/feature/range-scan"
+    ZERO_SHA = "0" * 40
+
+    def _make_repo(self, td):
+        _git(td, "init", "-q")
+        _git(td, "symbolic-ref", "HEAD", self.BRANCH)
+        _git(td, "config", "user.email", "hook-test@example.invalid")
+        _git(td, "config", "user.name", "Hook Test")
+        init_project(td, project_name="range-scan")
+
+    def _commit(self, td, name, content, message):
+        Path(td, name).write_text(content, encoding="utf-8")
+        _git(td, "add", name)
+        _git(td, "commit", "-q", "-m", message)
+        return _git(td, "rev-parse", "HEAD")
+
+    def _run_hook(self, td, stdin_text):
+        """Run the installed hook with LF-only stdin (as git sends it); return (rc, output)."""
+        hook = Path(td, ".git", "hooks", "pre-push").as_posix()
+        result = subprocess.run(
+            ["bash", hook, "origin", "https://example.invalid/range-scan.git"],
+            input=stdin_text.encode("utf-8"), cwd=td, capture_output=True, timeout=120,
+        )
+        return result.returncode, (result.stdout + result.stderr).decode("utf-8", errors="replace")
+
+    def _push_line(self, local_sha, remote_sha):
+        return f"{self.BRANCH} {local_sha} {self.BRANCH} {remote_sha}\n"
+
+    def test_committed_secret_blocked_with_nothing_staged(self):
+        # Dummy key assembled at runtime; never a literal key in source.
+        dummy_key = "AKIA" + "3V7QK2ZT9WRX4LMD"
+        with tempfile.TemporaryDirectory() as td:
+            self._make_repo(td)
+            base = self._commit(td, "README.md", "clean base\n", "base")
+            leak = self._commit(td, "config.txt", f"aws_key = {dummy_key}\n", "leak")
+            self.assertEqual(_git(td, "diff", "--cached", "--name-only"), "")
+            rc, out = self._run_hook(td, self._push_line(leak, base))
+            self.assertNotEqual(rc, 0, out)
+
+    def test_clean_pushed_commit_exits_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_repo(td)
+            base = self._commit(td, "README.md", "clean base\n", "base")
+            clean = self._commit(td, "notes.txt", "nothing sensitive here\n", "clean")
+            rc, out = self._run_hook(td, self._push_line(clean, base))
+            self.assertEqual(rc, 0, out)
+
+    def test_committed_secret_blocked_on_new_branch(self):
+        dummy_key = "AKIA" + "3V7QK2ZT9WRX4LMD"
+        with tempfile.TemporaryDirectory() as td:
+            self._make_repo(td)
+            self._commit(td, "README.md", "clean base\n", "base")
+            leak = self._commit(td, "config.txt", f"aws_key = {dummy_key}\n", "leak")
+            rc, out = self._run_hook(td, self._push_line(leak, self.ZERO_SHA))
+            self.assertNotEqual(rc, 0, out)
+
+    def test_branch_deletion_exits_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_repo(td)
+            base = self._commit(td, "README.md", "clean base\n", "base")
+            rc, out = self._run_hook(td, self._push_line(self.ZERO_SHA, base))
+            self.assertEqual(rc, 0, out)
+
+    def test_malformed_stdin_line_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_repo(td)
+            base = self._commit(td, "README.md", "clean base\n", "base")
+            rc, out = self._run_hook(td, f"{self.BRANCH} {base}\n")
+            self.assertNotEqual(rc, 0, out)
+
+    def test_missing_scanner_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_repo(td)
+            base = self._commit(td, "README.md", "clean base\n", "base")
+            clean = self._commit(td, "notes.txt", "nothing sensitive here\n", "clean")
+            Path(td, "tools", "secret_scan.py").unlink()
+            rc, out = self._run_hook(td, self._push_line(clean, base))
+            self.assertNotEqual(rc, 0, out)
+
+
 if __name__ == "__main__":
     unittest.main()
