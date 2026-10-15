@@ -549,9 +549,67 @@ class AsciiScopeTest(unittest.TestCase):
         path.write_bytes(text.encode("utf-8"))
         return path
 
-    def _baseline(self, files):
+    def _baseline(self, counts):
         (self.root / "tools" / "encoding-ascii-baseline.json").write_text(
-            json.dumps({"files": files}), encoding="utf-8")
+            json.dumps({"files": counts}), encoding="utf-8")
+
+    def _run_cli(self):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "encoding_lint.py"),
+             "--root", str(self.root), "--paths", str(self.root / "tools")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
+        )
+
+    def test_baselined_file_gaining_one_non_ascii_char_is_flagged(self):
+        # The old whole-file exemption let a baselined file gain characters
+        # and still scan clean. The ratchet is per-file COUNT now.
+        self._write("tools/x.py", "# a — b\n")
+        self._baseline({"tools/x.py": 1})
+        self._write("tools/x.py", "# a — b é\n")
+        findings = el.ascii_findings(self.root)
+        self.assertTrue(findings, findings)
+        self.assertTrue(all(f["file"].endswith("x.py") for f in findings), findings)
+        result = self._run_cli()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"tools[\\/]x\.py")
+
+    def test_baselined_file_at_its_count_is_clean(self):
+        self._write("tools/x.py", "# a — b é\n")
+        self._baseline({"tools/x.py": 2})
+        self.assertEqual(el.ascii_findings(self.root), [])
+        self.assertEqual(self._run_cli().returncode, 0)
+
+    def test_baselined_file_below_its_count_is_clean(self):
+        self._write("tools/x.py", "# a — b\n")
+        self._baseline({"tools/x.py": 2})
+        self.assertEqual(el.ascii_findings(self.root), [])
+        self.assertEqual(self._run_cli().returncode, 0)
+
+    def test_ratchet_counts_characters_not_lines(self):
+        # Two non-ASCII characters on ONE line against a baseline of 1 is a rise.
+        self._write("tools/x.py", "# — é\n")
+        self._baseline({"tools/x.py": 1})
+        self.assertTrue(el.ascii_findings(self.root))
+
+    def test_malformed_baselines_fail_closed(self):
+        self._write("tools/x.py", "# a — b\n")
+        bad_bodies = [
+            '{"files": ["tools/x.py"]}',                      # old plain-list format
+            '{"files": {"tools/x.py": -1}}',                  # negative count
+            '{"files": {"tools/x.py": true}}',                # bool is not a count
+            '{"files": {"tools/x.py": 1.5}}',                 # non-integer count
+            '{"files": {"tools/x.py": "1"}}',                 # string count
+            '{"files": {"tools/x.py": 1, "tools/x.py": 9}}',  # duplicate key hides a raise
+            '[]',                                             # wrong top level
+        ]
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                (self.root / "tools" / "encoding-ascii-baseline.json").write_text(
+                    body, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    el.ascii_findings(self.root)
+                self.assertEqual(self._run_cli().returncode, 2)
 
     def test_em_dash_in_tools_file_is_flagged(self):
         self._write("tools/x.py", "# a — b\nprint('ok')\n")
@@ -587,25 +645,25 @@ class AsciiScopeTest(unittest.TestCase):
 
     def test_baselined_non_ascii_file_is_allowed(self):
         self._write("tools/x.py", "# a — b\n")
-        self._baseline(["tools/x.py"])
+        self._baseline({"tools/x.py": 1})
         self.assertEqual(el.ascii_findings(self.root), [])
 
     def test_new_non_ascii_file_is_flagged_even_with_a_baseline(self):
         self._write("tools/old.py", "# a — b\n")
         self._write("tools/new.py", "# a → b\n")
-        self._baseline(["tools/old.py"])
+        self._baseline({"tools/old.py": 1})
         findings = el.ascii_findings(self.root)
         self.assertEqual([f["file"].endswith("new.py") for f in findings], [True])
 
     def test_baselined_file_that_became_clean_is_a_stale_entry(self):
         self._write("tools/x.py", "print('clean')\n")
-        self._baseline(["tools/x.py"])
+        self._baseline({"tools/x.py": 1})
         findings = el.ascii_findings(self.root)
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("remove", findings[0]["message"])
 
     def test_baseline_entry_for_missing_file_is_a_stale_entry(self):
-        self._baseline(["tools/gone.py"])
+        self._baseline({"tools/gone.py": 1})
         findings = el.ascii_findings(self.root)
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("remove", findings[0]["message"])
@@ -632,14 +690,14 @@ class AsciiScopeTest(unittest.TestCase):
 
     def test_baseline_query_reports_stale_entries_as_json(self):
         self._write("tools/x.py", "print('clean')\n")
-        self._baseline(["tools/x.py", "tools/gone.py"])
+        self._baseline({"tools/x.py": 1, "tools/gone.py": 1})
         result = self._baseline_query(self.root / "tools" / "encoding-ascii-baseline.json")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["stale"], ["tools/gone.py", "tools/x.py"])
 
     def test_baseline_query_is_empty_when_every_entry_is_live(self):
         self._write("tools/x.py", "# a — b\n")
-        self._baseline(["tools/x.py"])
+        self._baseline({"tools/x.py": 1})
         result = self._baseline_query(self.root / "tools" / "encoding-ascii-baseline.json")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["stale"], [])
@@ -659,7 +717,7 @@ class AsciiScopeTest(unittest.TestCase):
             (ROOT / "tools" / "encoding-ascii-baseline.json").read_text(encoding="utf-8"))
         files = baseline["files"]
         self.assertLessEqual(len(files), self.BASELINE_CEILING)
-        self.assertEqual(len(files), len(set(files)))
+        self.assertTrue(all(type(n) is int and n > 0 for n in files.values()), files)
 
     def test_repo_tools_are_ascii_under_the_ratchet(self):
         self.assertEqual(el.ascii_findings(ROOT), [])

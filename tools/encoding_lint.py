@@ -19,8 +19,9 @@ Flags:
 
 Allows: binary mode (`'rb'`, `'wb'`) -- no encoding needed.
 Suppression: `# encoding-ok` inline comment.
-ASCII rule: tools/*.py must be ASCII-only (LANE-CONTRACT section 6). Ratcheted by
-tools/encoding-ascii-baseline.json, which may only shrink (see ascii_findings).
+ASCII rule: tools/*.py must be ASCII-only (LANE-CONTRACT section 6). Ratcheted per
+file by non-ASCII character count in tools/encoding-ascii-baseline.json: a count may
+stay or fall, never rise (see ascii_findings).
 
 This guardrail prevents cp1252/locale-encoding surprises on Windows
 (e.g., tracker.json UnicodeDecodeError, subprocess text=True failure) AND the
@@ -292,18 +293,45 @@ def scan_ascii(filepath: Path) -> List[Dict]:
     return findings
 
 
-def load_ascii_baseline(path: Path) -> set:
-    """Ratchet baseline at `path`: the tools/*.py files allowed to stay non-ASCII.
+def _count_non_ascii(filepath: Path) -> int:
+    """Number of non-ASCII characters in `filepath` -- the ratchet's unit.
 
-    A missing file is an empty baseline. A malformed one raises (fail closed).
+    Decodes as UTF-8 with replacement, so a BOM (U+FEFF) or an invalid byte is
+    counted rather than silently passing. Matches what scan_ascii reports.
+    """
+    text = filepath.read_bytes().decode('utf-8', errors='replace')
+    return sum(1 for ch in text if ord(ch) > 127)
+
+
+def _reject_duplicate_keys(pairs: List) -> Dict:
+    """json object_pairs_hook: a repeated key would silently drop an earlier count."""
+    out: Dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f'duplicate key {key!r} in ASCII baseline')
+        out[key] = value
+    return out
+
+
+def load_ascii_baseline(path: Path) -> Dict[str, int]:
+    """Ratchet baseline at `path`: tools/*.py path -> allowed non-ASCII character count.
+
+    Shape: {"files": {"tools/x.py": <non-negative int>, ...}}. A missing file is an
+    empty baseline. Anything else malformed raises ValueError (fail closed): a
+    plain list, a non-integer or boolean count, a negative count, a duplicate key
+    (which would hide a raised count), or a non-object top level.
     """
     if not path.exists():
-        return set()
-    data = json.loads(path.read_text(encoding='utf-8'))
-    files = data.get('files') if isinstance(data, dict) else None
-    if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
-        raise ValueError(f'{path}: expected {{"files": [str, ...]}}')
-    return set(files)
+        return {}
+    data = json.loads(
+        path.read_text(encoding='utf-8'), object_pairs_hook=_reject_duplicate_keys)
+    counts = data.get('files') if isinstance(data, dict) else None
+    if not isinstance(counts, dict):
+        raise ValueError(f'{path}: expected {{"files": {{path: count, ...}}}}')
+    for rel, count in counts.items():
+        if not isinstance(rel, str) or type(count) is not int or count < 0:
+            raise ValueError(f'{path}: bad non-ASCII count for {rel!r}: {count!r}')
+    return dict(counts)
 
 
 def _ascii_scope(root: Path) -> Dict[str, Path]:
@@ -319,16 +347,34 @@ def ascii_stale_entries(root: Path, baseline_path: Path) -> List[str]:
     scope = _ascii_scope(root)
     stale = []
     for rel in sorted(load_ascii_baseline(baseline_path)):
-        if rel not in scope or not scan_ascii(scope[rel]):
+        if rel not in scope or _count_non_ascii(scope[rel]) == 0:
             stale.append(rel)
     return stale
 
 
-def ascii_findings(root: Path, baseline_path: Optional[Path] = None) -> List[Dict]:
-    """ASCII-only rule for tools/*.py (non-recursive), with a shrink-only ratchet.
+def ascii_lowered_entries(root: Path, baseline_path: Path) -> Dict[str, int]:
+    """Baselined files whose count fell below their baseline: rel -> current count.
 
-    A non-ASCII file not in the baseline is a finding. A baselined entry that is
-    now clean, missing or out of scope is a stale entry the baseline must drop.
+    A fall passes the lint. The baseline should then be lowered by hand to match,
+    otherwise the file could re-rise to the old count and still pass unnoticed.
+    """
+    scope = _ascii_scope(root)
+    lowered: Dict[str, int] = {}
+    for rel, allowed in sorted(load_ascii_baseline(baseline_path).items()):
+        if rel in scope:
+            actual = _count_non_ascii(scope[rel])
+            if 0 < actual < allowed:
+                lowered[rel] = actual
+    return lowered
+
+
+def ascii_findings(root: Path, baseline_path: Optional[Path] = None) -> List[Dict]:
+    """ASCII-only rule for tools/*.py (non-recursive), ratcheted per file by count.
+
+    A file not in the baseline may hold no non-ASCII character. A baselined file
+    may hold at most its baselined count: a rise is a finding, a fall or an equal
+    count passes. A baselined entry that is now clean, missing or out of scope is
+    a stale entry the baseline must drop.
     """
     if baseline_path is None:
         baseline_path = root / ASCII_BASELINE_RELPATH
@@ -337,6 +383,18 @@ def ascii_findings(root: Path, baseline_path: Optional[Path] = None) -> List[Dic
     for rel, pyfile in _ascii_scope(root).items():
         if rel not in baseline:
             findings.extend(scan_ascii(pyfile))
+            continue
+        allowed = baseline[rel]
+        actual = _count_non_ascii(pyfile)
+        if actual > allowed:
+            findings.extend(scan_ascii(pyfile))
+            findings.append(_finding(
+                pyfile, 0, 0,
+                f"{rel} has {actual} non-ASCII characters but {baseline_path.name} "
+                f"allows {allowed}; the ratchet only lets a count stay or fall "
+                f"(use -- and ->, or \\uXXXX escapes)",
+                '',
+            ))
     for rel in ascii_stale_entries(root, baseline_path):
         findings.append(_finding(
             root / rel, 0, 0,
@@ -482,8 +540,10 @@ def run(
             all_findings.extend(findings)
 
     # tools/*.py is held to the ASCII-only rule whenever tools/ is scanned.
+    lowered: Dict[str, int] = {}
     if (root / 'tools').resolve() in scan_dirs:
         all_findings.extend(ascii_findings(root))
+        lowered = ascii_lowered_entries(root, root / ASCII_BASELINE_RELPATH)
 
     # Output results
     if json_output:
@@ -491,6 +551,7 @@ def run(
             'findings': all_findings,
             'count': len(all_findings),
             'root': str(root),
+            'lowered': lowered,
         }
         print(json.dumps(output, indent=2))
     else:
@@ -509,6 +570,11 @@ def run(
                     print(f"   {finding['code']}")
         else:
             print("[OK] No encoding issues found")
+        for rel, actual in lowered.items():
+            print(
+                f"note: {rel} now has {actual} non-ASCII characters, below its "
+                f"baseline; lower it in {ASCII_BASELINE_RELPATH} to keep the ratchet tight"
+            )
 
     return 1 if all_findings else 0
 
