@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added `tools/pr_trigger_check.py`, a read-only single-shot detector that reports open PRs whose current head sha has no `pull_request` workflow run (exit 1 if any open non-draft PR lacks one, 2 on gh error); detects only, never remediates (#1088).
 - CI hardening: every GitHub Actions `uses:` pinned to a full commit SHA with a version comment; top-level `permissions: contents: read` in every workflow, with write grants moved to the jobs that need them; npm pinned to 12.2.0 in publish.yml (the version the last green publish used).
 - Docs: `SECURITY.md` supported-versions table now lists 0.10.x (older lines not supported); `ui/README.md` Python floor and dependency statement aligned with the root README (Python 3.11+).
 
