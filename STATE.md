@@ -19,7 +19,10 @@
   5. #1018 resume (github-agent): merge main in aesop-wt-1018, push 5980725a, auto-merge.
   6. #997 resume (github-agent): merge main, push, report windows leg red diagnosis if still red.
   7-10. #1025 #1020 #1014 #1011 merge-main lanes (above).
-- NEXT after fleet lands: ff-pull ~/.claude (lane 3) and ~/scripts (lane 1); decide subprocess_guard CI wiring from lane 4's finding; decide whether incident-report-gate should be required; receipts design after #1020 merges; run idle_tick when nothing else is actionable.
+- BOUND 14:20Z: claude-config #22 MERGED 120c9f17 (lane 3 done: read-only gh pr view/checks + gh run view/list allowlisted, pipe/background bypass closed, 82/82 hook tests, _failclosed 0 violations; for-loops stay denied; a `|` inside a quoted commit message is now denied at the ceiling, reword). origin/master fetched into ~/.claude, tracked tree clean, but the ff-pull and the live hook-test run were DENIED by the ceiling hook and are NOT done. FIRST after clear: `git -C ~/.claude pull --ff-only origin master`, `git -C ~/.claude branch -d fix/main-context-ceiling-gh-readonly`, `node ~/.claude/hooks/main-context-ceiling.test.mjs`.
+- DISPATCHED 14:18Z: gate-escape-resolver lane (general-purpose haiku, worktree aesop-wt-escape-993, branch fix/escape-38673452130) for main-full run 38673452130 red on a6dce61d (#993, windows shard 3; six later main-full runs green). Expect REFUTED-TRANSIENT or a wall PR. Other queued escapes are owned: #997 windows-shard (0) by lane 6, #1025 verify-receipt by #1020.
+- Open findings f-dea6f2c9 and f-a7966b74 CLOSED (bound #1012/#1029). idle_tick TOP (promote G13) is already done (see above).
+- NEXT after fleet lands: ff-pull ~/scripts (lane 1); decide subprocess_guard CI wiring from lane 4's finding; decide whether incident-report-gate should be required; receipts design after #1020 merges; run idle_tick when nothing else is actionable.
 - Note for hooks: dispatches to brain repos (claude-scripts, claude-config) are refused by the lane-contract hook unless the brief names C:/Users/Mattt/Desktop/aesop/LANE-CONTRACT.md; two briefs were resent with that line.
 
 ## CURRENT (2026-10-14 mid-wave checkpoint)
