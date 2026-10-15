@@ -23,9 +23,12 @@ is measured, the hosted re-run can become a sample instead of a tax.
 `tools/emit_receipt.py --post` on every push, once every gate above it has passed (see
 hooks/CLAUDE.md item 16). A day-1 measurement of the manual-only design found 41 merged
 PRs and ZERO receipts — lanes were never told to run the emitter and nothing ran it for
-them, so the honesty signal had no data. The hook step is ALWAYS fail-open: a missing
-tool/python/`gh`/signing-key, or a red matrix part, prints a one-line WARN and never
-blocks the push. `AESOP_RECEIPT_EMIT=0` opts out entirely. Manual invocation still works
+them, so the honesty signal had no data. The hook is a CONCLUSION GATE: a red required
+part (emitter exit 3 under `--fail-on-red`) or an unreadable conclusion (timeout, any other
+emitter exit) blocks the push, and the failure receipt is still posted as the trace; a
+missing tool/python/`gh`/signing-key (matrix never ran) still WARNs and proceeds, and a
+skipped-with-reason part never blocks. `AESOP_PUSH_RED=1` is the one recorded emergency
+override (emitter exit 4; the receipt is stamped `pushed_red: true`). `AESOP_RECEIPT_EMIT=0` opts out entirely. Manual invocation still works
 the same way, e.g. for a `--dry-run` preview or a narrower `--matrix`:
 
 ```
@@ -59,8 +62,21 @@ then flush it once the sha exists on GitHub. The flush runs automatically:
    if their shas now exist on GitHub. The flush runs with scrubbed environment (GIT_* vars
    unset) to maintain isolation. Fail-open: errors do not block the push.
 
-2. **In `tools/pr_sweep.py`** (session-independent watchdog actor): Once per sweep, `receipt_flush.py`
-   flushes any remaining spooled receipts.
+2. **Detached poller (`tools/receipt_autoflush.py --spawn`)**: when the hook's emit reports
+   "spooled", it forks a background poller that checks `gh api repos/<slug>/commits/<sha>` every
+   15s for up to 10 minutes and posts that sha's receipt the moment it exists. The push never
+   waits on it. Its outcome (posted / gave up with the reason) goes to `<spool>/<sha>.flush.log`.
+   `AESOP_RECEIPT_AUTOFLUSH=0` disables it.
+
+3. **Watchdog backstop (`daemons/run-watchdog.sh` `run_receipt_flush`)**: every cycle, on both the
+   `--once` and daemon paths, runs `receipt_flush.py --repo $AESOP_ROOT`. `tools/pr_sweep.py` also
+   flushes, but for its own repo. It used to target the hardcoded `~/aesop`, a stale non-git copy,
+   so the spool (which lives in the pushing repo's git common dir) was never found and nothing was
+   posted. That was the recurring gap: a spooled receipt sat until someone re-ran the flush by hand.
+
+4. **verify-receipt retry**: `verify-receipt.yml` fetches the receipt once, and if it is missing,
+   re-checks once after 60s before failing. It stays fail-closed on MISSING, and the job summary
+   names the attempt that found it.
 
 The flush tool is idempotent: it retries failed receipts indefinitely (up to `--max-age-days`,
 default 7 days), deletes them on success, and keeps them on transient errors (sha not yet pushed).
@@ -83,11 +99,12 @@ under the marker `<!-- aesop-receipt:verify-receipt-local -->`. The Action reads
 
 ```json
 {"receipt": {
-   "schema": 1, "schema_version": 1, "repo": "owner/name",
+   "schema": 1, "schema_version": 1, "profile": "scoped",
+   "repo": "owner/name",
    "head_sha": "...", "base_sha": "<merge-base with origin/main>",
    "tree_hash": "<git rev-parse HEAD^{tree}>",
    "parts":   [{"name": "py-shard-0", "exit_code": 0, "test_count": 212, "duration_s": 48.1}, ...],
-   "skipped": [{"name": "browser-proofs", "reason": "not runnable here: ..."}],
+   "skipped": [{"name": "browser-proofs", "reason": "not runnable here: ..."}, {"name": "py-shard-1", "reason": "not in scope: no changed file maps to this shard (profile=scoped)"}],
    "host": {"os": "windows", "python": "3.12.4", "hostname_hash": "<sha256[:16]>"},
    "timestamp": "2026-10-06T14:02:11Z"},
  "sig": {"scheme": "ed25519", "value": "<base64>", "key_id": "<sha256(pubkey)[:16]>"}}
@@ -95,13 +112,23 @@ under the marker `<!-- aesop-receipt:verify-receipt-local -->`. The Action reads
 
 Canonical form: `json.dumps(receipt, sort_keys=True, separators=(",", ":"))`. The
 signature covers the canonical bytes, so changing **any** field (an exit code, the tree,
-the base) invalidates it. The optional `schema_version` field (default: absent, treated as version 1 for backward compatibility) enables forward-compatible extensions without breaking existing verifiers.
+the base) invalidates it. The optional `schema_version` field (default: absent, treated as version 1 for backward compatibility) enables forward-compatible extensions without breaking existing verifiers. The optional `profile` field (default: absent, treated as "scoped" for backward compatibility) records which profile was used to select the matrix.
+
+## Matrix profiles: default scoped, full available
+
+By default, the pre-push receipt emits using `profile: "scoped"`: it runs the fast pre-push gates always (`secret-scan`, `claudemd-sync-gate`, `gen-tool-index`, `verify-test-suite-count`, `encoding-lint`, `import-resolution-check`, `sibling-import-check`) PLUS only the python shards (`py-shard-0..3`) that own files changed in this push (derived from `git diff --name-only <base>..<tip>` mapped through the shard assignment in `ci_shard_runner.py`'s round-robin distribution). Shards not in scope are recorded under `skipped` with reason `"not in scope: no changed file maps to this shard (profile=scoped)"`.
+
+The scoped profile is the default because the full matrix (`py-shard-0..3`) can exceed pre-push timeout budgets on slow boxes (measured ~1250s locally while the hook timeout is 900s); scoped runs reduce that to minutes when most changes are docs-only or touch a few test files. Parts that cannot run on a dev box (`browser-proofs`, `windows-shard`) remain always-skipped, and the verifier's required-parts list never changes.
+
+- **Scoped (default):** `AESOP_RECEIPT_PROFILE=scoped` or unset. Run fast parts + owning shards only.
+- **Full:** `AESOP_RECEIPT_PROFILE=full`. Run fast parts + all shards (today's behavior). Available for explicit measurement or CI runs; set on the command line when you want the old behavior.
+- **Manual override:** `python tools/emit_receipt.py --matrix py-shard-0,secret-scan --post` always respects an explicit `--matrix` argument regardless of profile.
+- **Underivable mapping:** If the shard assignment cannot be determined (e.g., `git ls-files` fails), the profile falls back to `full` to stay safe.
 
 Default matrix: `py-shard-0..3` (`tools/ci_shard_runner.py n 4`) plus the pre-push gate
-set (`secret-scan`, `claudemd-sync-gate`, `gen-tool-index`, `verify-test-suite-count`,
-`encoding-lint`, `import-resolution-check`, `sibling-import-check`). Parts that cannot
-run on a dev box (`browser-proofs`, `windows-shard`) are recorded under `skipped` with a
-reason — never silently dropped — and are *not* in the verifier's required list.
+set, with scoping applied per the profile above. Parts that cannot run on a dev box
+(`browser-proofs`, `windows-shard`) are recorded under `skipped` with a reason —
+never silently dropped — and are *not* in the verifier's required list.
 
 ## Signing scheme
 
@@ -128,6 +155,20 @@ checked against the registered key whose key_id (`sha256(pem)[:16]`) equals `sig
 signature must still verify under that key. Provisioning a new box: generate its private key
 to `~/.aesop/receipt_key.pem` (outside any checkout) with `generate_ed25519_keypair`, then
 commit its public key as `tools/receipt_pubkeys/<name>-<key_id>.pub`. Never commit a private key.
+
+**Key rotation (base trust).** The verifier and keyring the Action uses come from the BASE tree
+(`base.sha`, or `main` on `workflow_dispatch`), never from the PR head: a PR that registers a
+signer key in its own checkout cannot make a receipt signed by that key verify (adversarial
+finding on #970). So adding or rotating a key is a two-step flow:
+
+1. Land the key in its own PR (`tools/receipt_pubkeys/<name>-<key_id>.pub`, or the rotated
+   `tools/receipt_pubkey.pub`) and merge it to `main`.
+2. Only after that merge do receipts signed by the new key verify. Until then such a receipt is
+   `INVALID` ("signature: does not verify under ed25519") on every PR, including the key's own PR.
+
+`verify_receipt.py --keyring DIR` names the registered-keys directory explicitly (the Action passes
+`base/tools/receipt_pubkeys`). An empty `--required` list is refused (exit 2) unless the deliberate
+local-only flag `--allow-no-required-parts` is given; CI never passes it.
 
 ## Trust boundary — what a valid receipt proves, and what it does not
 
@@ -160,7 +201,7 @@ Does **not** prove:
 
 | Receipt on head sha | Result |
 |---|---|
-| none | **succeeds** with a `::notice` + step summary "no receipt" — not required yet, never blocks a PR |
+| none | **fails** (exit 1, fail-closed: `MISSING receipt` names the sha and where it was looked for). Still non-required, so it does not block merges until promotion |
 | present, valid | succeeds, prints `receipt VALID` |
 | present, invalid (tree/head/base/signature/required part) | **fails** — a bad receipt is a real defect even while non-required |
 | present, cannot evaluate (malformed, unknown scheme, no key material) | **fails** (exit 2, fail-closed) |
@@ -171,8 +212,8 @@ Exit codes of `tools/verify_receipt.py`: `0` valid, `1` invalid, `2` cannot eval
 (`tools/verify_receipt.py --fetch-for-head`) only ever LOOKS for a receipt; a failure
 while looking -- a `gh api` error, a malformed check-run payload, or the PR's own tree
 predating this tool entirely (the job checks out the PR head, not main) -- is
-indistinguishable from "no receipt was posted" and always degrades to the "none" row,
-never to a crash. Only a receipt the fetch step actually extracted and then handed to
+indistinguishable from "no receipt was posted" and lands on the "none" row (fails
+closed, exit 1), never on a crash. Only a receipt the fetch step actually extracted and then handed to
 `verify()` can land on the "invalid" or "cannot evaluate" rows. (2026-10-06 incident:
 PRs #856/#857 showed FAILURE because the inline fetch script raised
 `ModuleNotFoundError` on branches cut before this file existed -- fixed by making the

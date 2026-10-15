@@ -33,9 +33,12 @@ Options:
   --json: Output JSON instead of text
   --update-baseline: Regenerate baseline from current violations (CI must never use)
 """
+import ast
+import io
 import json
 import re
 import sys
+import tokenize
 from pathlib import Path
 
 
@@ -81,7 +84,135 @@ MARKDOWN_FILES_TO_PROTECT = [
 ]
 
 # Directories to scan for violations
-SCAN_DIRS = ["ui", "tools", "state_store"]  # Include state_store to catch internal issues
+SCAN_DIRS = ["ui", "tools", "state_store", "driver"]  # Include state_store to catch internal issues
+
+# Directories where a raw tracker.json WRITE is a violation (F-01). The write check is
+# AST-based and runs even when a file imports the WriteAPI facade: a facade import
+# exempts a file from the string-literal read patterns, which must not also exempt a
+# regression that writes tracker.json directly (the driver/wave_scheduler.py bug).
+TRACKER_WRITE_GATE_DIRS = ["driver"]
+_TRACKER_TOKENS = ("tracker.json", "tracker_path", "tracker_file")
+
+
+def _mentions_tracker(node):
+    """True if the expression's source text names tracker.json or a tracker path var."""
+    try:
+        src = ast.unparse(node)
+    except Exception:
+        return False
+    return any(tok in src for tok in _TRACKER_TOKENS)
+
+
+def tracker_raw_write_sites(source):
+    """Return line numbers of raw writes whose target is a tracker.json path.
+
+    Taint-lite: a name is tracked if it is a tracker_path/tracker_file parameter or is
+    assigned from an expression naming tracker.json or a tracked name. Sinks:
+    os.replace/os.rename/shutil.move destination, Path.write_text receiver, and
+    open() in a write/append/create mode on a tracked path.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    tracked = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg) and node.arg in ("tracker_path", "tracker_file"):
+            tracked.add(node.arg)
+
+    def _is_tracked(expr):
+        if isinstance(expr, ast.Name) and expr.id in tracked:
+            return True
+        return _mentions_tracker(expr)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not _is_tracked(node.value):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id not in tracked:
+                    tracked.add(target.id)
+                    changed = True
+
+    lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name in ("replace", "rename", "move") and len(node.args) >= 2 and _is_tracked(node.args[1]):
+            lines.append(node.lineno)
+        elif name == "write_text" and isinstance(func, ast.Attribute) and _is_tracked(func.value):
+            lines.append(node.lineno)
+        elif name == "open" and node.args and _is_tracked(node.args[0]):
+            mode = ""
+            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                mode = str(node.args[1].value)
+            for kw in node.keywords:
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                    mode = str(kw.value.value)
+            if any(ch in mode for ch in "wax"):
+                lines.append(node.lineno)
+    return sorted(set(lines))
+
+
+def _byte_col_to_char(line, byte_col):
+    """Convert an ast (UTF-8 byte) column into a character index for `line`."""
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+
+
+def python_code_view(source):
+    """Return `source` with docstrings and comments blanked to spaces.
+
+    Line count and column positions are preserved, so the regex patterns below only
+    ever match code and non-docstring string literals: a state path named in a module,
+    class or function docstring, or in a ``#`` comment, is documentation, not an access.
+    Real accesses (open/Path/os calls, any other string literal) are left intact.
+
+    Falls back to the raw source when the file cannot be parsed or tokenized, so a
+    broken file keeps the old (stricter) raw-text detection instead of hiding accesses.
+    """
+    try:
+        tree = ast.parse(source)
+        lines = source.split("\n")
+        spans = []  # (start_row, start_char, end_row, end_char); end is exclusive
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.body:
+                continue
+            first = node.body[0]
+            if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                continue
+            s_line = lines[first.lineno - 1]
+            e_line = lines[first.end_lineno - 1]
+            spans.append((
+                first.lineno,
+                _byte_col_to_char(s_line, first.col_offset),
+                first.end_lineno,
+                _byte_col_to_char(e_line, first.end_col_offset),
+            ))
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                row, col = tok.start
+                spans.append((row, col, row, len(lines[row - 1])))
+    except Exception:
+        return source
+
+    grid = [list(line) for line in lines]
+    for r1, c1, r2, c2 in spans:
+        for row in range(r1, r2 + 1):
+            start = c1 if row == r1 else 0
+            end = c2 if row == r2 else len(grid[row - 1])
+            for col in range(start, min(end, len(grid[row - 1]))):
+                grid[row - 1][col] = " "
+    return "\n".join("".join(row) for row in grid)
 
 
 def find_direct_opens(repo_root):
@@ -143,6 +274,12 @@ def find_direct_opens(repo_root):
             except Exception:
                 continue
 
+            # F-01: raw tracker.json writes are checked BEFORE the facade-import skip below.
+            if scan_dir in TRACKER_WRITE_GATE_DIRS and tracker_raw_write_sites(content):
+                violation_key = f"{relative_path.as_posix()}@tracker-json-raw-write"
+                if violation_key not in violations:
+                    violations.append(violation_key)
+
             # Skip if file imports read_api or write_api (it's using the facade correctly)
             if "from state_store.read_api import" in content or "import state_store.read_api" in content:
                 continue
@@ -154,17 +291,12 @@ def find_direct_opens(repo_root):
             if "from state_store import StateAPI" in content or "from state_store import (" in content and "StateAPI" in content:
                 continue
 
-            # Scan for violations
-            for line_num, line in enumerate(content.split("\n"), 1):
+            # Scan for violations over the code view: docstrings and comments are blanked
+            # (AST/tokenize-aware), so only code and non-docstring string literals match.
+            for line_num, line in enumerate(python_code_view(content).split("\n"), 1):
                 # Check read violations
                 for pattern, pattern_id in read_patterns:
                     if re.search(pattern, line):
-                        # Additional filter: skip comment lines and string literals in docstrings
-                        if line.strip().startswith("#"):
-                            continue
-                        if '"""' in line or "'''" in line:
-                            continue
-
                         # Key is file@pattern-id (stable across line edits)
                         # Use posix separators for cross-platform consistency
                         violation_key = f"{relative_path.as_posix()}@{pattern_id}"
@@ -175,12 +307,6 @@ def find_direct_opens(repo_root):
                 # Check write violations
                 for pattern, pattern_id in write_patterns:
                     if re.search(pattern, line):
-                        # Skip comment lines and docstrings
-                        if line.strip().startswith("#"):
-                            continue
-                        if '"""' in line or "'''" in line:
-                            continue
-
                         violation_key = f"{relative_path.as_posix()}@{pattern_id}"
                         if violation_key not in violations:
                             violations.append(violation_key)

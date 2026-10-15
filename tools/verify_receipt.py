@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline verifier for a signed local receipt (the hosted side of the receipt gate).
-INDEX: Receipt-gate increment 2 -- offline verifier used by `.github/workflows/verify-receipt.yml`: input is a receipt envelope (`--receipt FILE|-`, as posted by `emit_receipt.py`) plus the head sha of ITS OWN checkout (`--head`, default HEAD); it RECOMPUTES `git rev-parse <head>^{tree}` and compares to the receipt's tree_hash (never trusts the lane's number), verifies the signature (Ed25519 against the committed `tools/receipt_pubkey.pub`, or HMAC-SHA256 against `$AESOP_RECEIPT_HMAC_SECRET`), validates `schema_version` (reject if >1; legacy receipts without it still verify for backward compatibility), checks freshness (receipt.base_sha must be an ancestor of `--main-ref` (origin/main) and at most `--max-behind` (50) commits behind its tip), and requires every REQUIRED part (`--required a,b` ; default py-shard-0..3) present with exit_code 0. Exit 0 = valid, 1 = INVALID (any check failed), 2 = cannot evaluate (unreadable/malformed envelope, no key material for the scheme, git failure) -- fail-closed, never exit 0 on doubt. Also exposes `extract_receipt_from_check_runs()` / `extract_receipt_from_comments()`, and a `--fetch-for-head SHA --repo-slug OWNER/REPO` CLI mode (`fetch_receipt_for_head()`) that the Action's fetch step uses to look up a receipt via `gh api`: this mode NEVER fails -- a lookup problem (gh api error, malformed payload, this module missing on a stale PR tree) degrades to "no receipt found", never to a job failure; only a receipt actually found and then shown invalid by the main verify path may exit nonzero. stdlib-only; `cryptography` optional (needed for ed25519 receipts).
+INDEX: Receipt-gate increment 2 -- offline verifier used by `.github/workflows/verify-receipt.yml`: input is a receipt envelope (`--receipt FILE|-`, as posted by `emit_receipt.py`) plus the head sha of ITS OWN checkout (`--head`, default HEAD); it RECOMPUTES `git rev-parse <head>^{tree}` and compares to the receipt's tree_hash (never trusts the lane's number), verifies the signature (Ed25519 against the committed `tools/receipt_pubkey.pub`, or HMAC-SHA256 against `$AESOP_RECEIPT_HMAC_SECRET`), validates `schema_version` (reject if >1; legacy receipts without it still verify for backward compatibility), checks freshness (receipt.base_sha must be an ancestor of `--main-ref` (origin/main) and at most `--max-behind` (50) commits behind its tip), and requires every REQUIRED part (`--required a,b` ; default py-shard-0..3) present with exit_code 0. Exit 0 = valid, 1 = INVALID (any check failed), 2 = cannot evaluate (unreadable/malformed envelope, no key material for the scheme, git failure) -- fail-closed, never exit 0 on doubt. Also exposes `extract_receipt_from_check_runs()` / `extract_receipt_from_comments()`, and a `--fetch-for-head SHA --repo-slug OWNER/REPO` CLI mode (`fetch_receipt_for_head()`) that the Action's fetch step uses to look up a receipt via `gh api`: FAIL-CLOSED on a missing receipt: no receipt found (or a lookup problem: gh api error, malformed payload) prints `MISSING receipt: ...` and exits 1; a missing `--receipt` file or a payload with no receipt exits 1 the same way. Exit 2 stays for present-but-unevaluable. Lookup never raises. stdlib-only; `cryptography` optional (needed for ed25519 receipts).
 
 What a PASS proves: the holder of the signing key ran the named parts on a tree whose
 hash equals the one in this checkout, those parts exited 0, and the run was against a
@@ -66,16 +66,24 @@ def _check_shape(envelope):
         raise CannotEvaluate("receipt.parts must be a list")
 
 
-def _signature_ok(canonical, sig, pubkey_path, hmac_secret):
+def _signature_ok(canonical, sig, pubkey_path, hmac_secret, keyring=None):
     """Ed25519 resolves by key_id across the keyring; HMAC keeps its single-secret check."""
     if sig.get("scheme") == "ed25519":
-        return rc.verify_signature_keyring(canonical, sig, rc.keyring_paths(pubkey_path))
+        return rc.verify_signature_keyring(canonical, sig, rc.keyring_paths(pubkey_path, extra_dir=keyring))
     return rc.verify_signature(canonical, sig, pubkey_path=pubkey_path, hmac_secret=hmac_secret)
 
 
-def verify(envelope, repo, head, main_ref, max_behind, required, pubkey_path, hmac_secret):
-    """Return (exit_code, reasons). 0 valid / 1 invalid / 2 cannot evaluate."""
+def verify(envelope, repo, head, main_ref, max_behind, required, pubkey_path, hmac_secret,
+           keyring=None, allow_no_required=False):
+    """Return (exit_code, reasons). 0 valid / 1 invalid / 2 cannot evaluate.
+
+    `keyring` is the registered-keys directory to trust (the CI gate passes the BASE tree's).
+    An empty `required` list proves nothing, so it is refused (exit 2) unless the caller
+    explicitly sets `allow_no_required` (--allow-no-required-parts; CI never does)."""
     try:
+        if not required and not allow_no_required:
+            raise CannotEvaluate("no required parts: an empty --required proves nothing "
+                                 "(pass --allow-no-required-parts only for a deliberate local check)")
         _check_shape(envelope)
         receipt, sig = envelope["receipt"], envelope["sig"]
         scheme = sig.get("scheme")
@@ -88,7 +96,7 @@ def verify(envelope, repo, head, main_ref, max_behind, required, pubkey_path, hm
         elif not rc.has_key_material(scheme, pubkey_path=pubkey_path, hmac_secret=hmac_secret):
             raise CannotEvaluate("no key material to verify scheme %s (pubkey=%s, hmac=%s)" % (
                 scheme, pubkey_path, "set" if hmac_secret else "unset"))
-        elif not _signature_ok(rc.canonical_json(receipt), sig, pubkey_path, hmac_secret):
+        elif not _signature_ok(rc.canonical_json(receipt), sig, pubkey_path, hmac_secret, keyring):
             reasons.append("signature: does not verify under %s" % scheme)
 
         head_full = _git_ok(repo, "rev-parse", "--verify", head + "^{commit}")
@@ -180,13 +188,13 @@ def fetch_receipt_for_head(sha, repo_slug, api=None):
     """Look up the newest local receipt for `sha`: check-runs first, commit comments as
     fallback. Returns (envelope_or_None, note).
 
-    This NEVER raises. A failure while merely LOOKING for a receipt -- a `gh api` call
-    erroring, a malformed payload, anything unexpected -- is indistinguishable from "no
-    receipt was posted" and must degrade to the absent case, never to a crash. Per the
-    design in docs/RECEIPT-GATE.md, only a receipt we actually found and then examined
-    may fail the gate (see `verify()`); failing to even find one must stay neutral.
+    This NEVER raises. A failure while merely LOOKING for a receipt (a `gh api` error, a
+    malformed payload, anything unexpected) is reported as a MISSING receipt, never as a
+    crash. Missing is fail-closed: the caller exits 1 (see `_run_fetch_for_head`), so the
+    gap is visible as a red check instead of a green one.
     """
     api = api or _gh_api
+    where = "check-runs and commit comments of %s" % repo_slug
     try:
         env = None
         runs = api("repos/%s/commits/%s/check-runs?per_page=100" % (repo_slug, sha))
@@ -197,10 +205,10 @@ def fetch_receipt_for_head(sha, repo_slug, api=None):
             if comments is not None:
                 env = extract_receipt_from_comments(comments)
         if env is None:
-            return None, "no %s receipt on %s" % (rc.CHECK_NAME, sha)
+            return None, "MISSING receipt: no %s receipt on %s (looked in %s)" % (rc.CHECK_NAME, sha, where)
         return env, "receipt found for %s (scheme=%s)" % (sha, env.get("sig", {}).get("scheme"))
-    except Exception as e:  # noqa: BLE001 -- defensive: a lookup failure is NOT an invalid receipt
-        return None, "receipt lookup failed unexpectedly (%s); treating as no receipt" % e
+    except Exception as e:  # noqa: BLE001 -- defensive: a lookup failure is reported as missing, not a crash
+        return None, "MISSING receipt: lookup for %s failed unexpectedly (%s) (looked in %s)" % (sha, e, where)
 
 
 def build_parser():
@@ -212,6 +220,11 @@ def build_parser():
     p.add_argument("--max-behind", type=int, default=50)
     p.add_argument("--required", default=",".join(rc.DEFAULT_REQUIRED_PARTS), help="comma-separated part names")
     p.add_argument("--pubkey", default=None, help="Ed25519 public key (default: <repo>/%s)" % rc.DEFAULT_PUBKEY_REL)
+    p.add_argument("--keyring", default=None,
+                   help="registered-keys dir trusted besides --pubkey (default: <pubkey dir>/receipt_pubkeys). "
+                        "The CI gate points this at the BASE tree (origin/main), never the PR head.")
+    p.add_argument("--allow-no-required-parts", action="store_true",
+                   help="accept an empty --required list (refused by default; CI never passes this)")
     p.add_argument("--extract", choices=("check-runs", "comments"), default=None,
                    help="treat --receipt as a GitHub API payload and extract the newest receipt first")
     p.add_argument("--fetch-for-head", metavar="SHA", default=None,
@@ -224,22 +237,24 @@ def build_parser():
 
 
 def _run_fetch_for_head(args):
-    """CLI body of --fetch-for-head. Always exits 0: this mode only LOOKS for a receipt
-    and must never fail the job over a lookup problem (see fetch_receipt_for_head)."""
+    """CLI body of --fetch-for-head. Exit 0 = a receipt was found (the caller then verifies
+    it); exit 1 = MISSING receipt (fail-closed: the gap is a red check, never a green one).
+    The out-files are written in every case so the workflow can still report the outcome."""
     try:
         if not args.repo_slug:
-            print("--repo-slug is required with --fetch-for-head", file=sys.stderr)
-            env, note = None, "--repo-slug missing; treating as no receipt"
+            env = None
+            note = "MISSING receipt: --repo-slug not given, cannot look up a receipt for %s" % args.fetch_for_head
         else:
             env, note = fetch_receipt_for_head(args.fetch_for_head, args.repo_slug)
         print(note)
         Path(args.out_found).write_text("true" if env is not None else "false", encoding="utf-8")
         if env is not None:
             Path(args.out_envelope).write_text(json.dumps(env), encoding="utf-8")
+        return 0 if env is not None else 1
     except Exception as e:  # noqa: BLE001 -- defensive: never crash this mode
-        print("--fetch-for-head failed unexpectedly (%s); treating as no receipt" % e, file=sys.stderr)
+        print("MISSING receipt: fetch for %s failed unexpectedly (%s)" % (args.fetch_for_head, e))
         Path(args.out_found).write_text("false", encoding="utf-8")
-    return 0
+        return 1
 
 
 def main(argv=None, environ=None):
@@ -252,6 +267,11 @@ def main(argv=None, environ=None):
         return 2
     repo = Path(args.repo).resolve()
     pubkey = Path(args.pubkey) if args.pubkey else repo / rc.DEFAULT_PUBKEY_REL
+    head_label = _git(repo, "rev-parse", "--verify", args.head + "^{commit}")[1] or args.head
+    if args.receipt != "-" and not Path(args.receipt).is_file():
+        # Missing receipt is fail-closed (exit 1), distinct from an unreadable/malformed one (exit 2).
+        print("MISSING receipt: no receipt file %s for head %s (%s)" % (args.receipt, head_label, rc.CHECK_NAME))
+        return 1
     try:
         envelope = load_envelope(args.receipt)
         if args.extract == "check-runs":
@@ -259,13 +279,16 @@ def main(argv=None, environ=None):
         elif args.extract == "comments":
             envelope = extract_receipt_from_comments(envelope)
         if envelope is None:
-            raise CannotEvaluate("no %s receipt found in the supplied payload" % rc.CHECK_NAME)
+            print("MISSING receipt: no %s receipt in the supplied payload for head %s" % (rc.CHECK_NAME, head_label))
+            return 1
     except CannotEvaluate as e:
         print("CANNOT EVALUATE: %s" % e, file=sys.stderr)
         return 2
     required = [n.strip() for n in args.required.split(",") if n.strip()]
+    keyring = Path(args.keyring) if args.keyring else None
     code, reasons = verify(envelope, repo=repo, head=args.head, main_ref=args.main_ref, max_behind=args.max_behind,
-                           required=required, pubkey_path=pubkey, hmac_secret=environ.get(rc.HMAC_ENV))
+                           required=required, pubkey_path=pubkey, hmac_secret=environ.get(rc.HMAC_ENV),
+                           keyring=keyring, allow_no_required=args.allow_no_required_parts)
     label = {0: "VALID", 1: "INVALID", 2: "CANNOT EVALUATE"}[code]
     print("receipt %s (head=%s scheme=%s parts=%d)" % (
         label, str(envelope.get("receipt", {}).get("head_sha", "?"))[:12],

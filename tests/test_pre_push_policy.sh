@@ -22,6 +22,42 @@ source "$HOOK_SCRIPT"
 test_passed=0
 test_failed=0
 
+# Gate code is judged from origin/main (hooks/pre-push-policy.sh gate_base_dir).
+# publish_base_tools <clone> <tools_src>: origin/main:tools/ becomes <tools_src>
+# (empty src -> only a placeholder), via a separate base repo fetched as origin.
+publish_base_tools() {
+  local clone="$1" src="$2" base="$1.base"
+  rm -rf "$base"
+  mkdir -p "$base/tools"
+  if [ -n "$src" ] && [ -d "$src" ]; then
+    cp -R "$src"/. "$base/tools/"
+  fi
+  : > "$base/tools/.keep"
+  git -C "$base" init -q -b main
+  git -C "$base" add -A
+  git -C "$base" -c user.email=t@example.com -c user.name=t -c core.autocrlf=false commit -q -m base
+  git -C "$clone" remote remove origin >/dev/null 2>&1 || true
+  git -C "$clone" remote add origin "$base"
+  git -C "$clone" fetch -q origin main
+}
+
+# make_clone_with_base <clone> <tools_src>: fresh clone on feature/test with a base published.
+make_clone_with_base() {
+  local clone="$1" src="$2"
+  rm -rf "$clone"
+  mkdir -p "$clone"
+  git -C "$clone" init -q -b main
+  git -C "$clone" config user.email t@example.com
+  git -C "$clone" config user.name t
+  git -C "$clone" config core.autocrlf false
+  printf 'base\n' > "$clone/README.md"
+  git -C "$clone" add -A
+  git -C "$clone" commit -q -m base
+  publish_base_tools "$clone" "$src"
+  git -C "$clone" checkout -q -b feature/test
+}
+
+
 # ===== NEW TESTS FOR 6 FINDINGS =====
 
 printf '\n=== Finding 1: Race condition in hash-chain (concurrent writes) ===\n'
@@ -274,6 +310,8 @@ printf '\n=== Test 7 (existing): Secret scan unavailable fails-CLOSED ===\n'
 (
   export AESOP_ROOT="$TEST_ROOT/aesop_no_scanner"
   mkdir -p "$AESOP_ROOT/state"
+  make_clone_with_base "$TEST_ROOT/no_scanner_clone" ""
+  cd "$TEST_ROOT/no_scanner_clone" || exit 1
 
   # Provide a valid 4-field tuple to get past empty-stdin check
   # This tests that when scanner is missing, it fails-closed (not when stdin is empty)
@@ -1005,6 +1043,7 @@ SCANNER
     git commit -q -m "initial"
     git checkout -q -b feature/isolated-empty-stdin
   )
+  publish_base_tools "$ISOLATED_MAIN_REPO" "$AESOP_ROOT/tools"  # gate code is pinned to origin/main
   stderr_output=$( { printf '' | ( cd "$ISOLATED_MAIN_REPO" && bash "$HOOK_SCRIPT" ); } 2>&1 1>/dev/null )
   exit_code=$?
 
@@ -1177,6 +1216,8 @@ sys.exit(0)
 SCANNER
   chmod +x "$AESOP_ROOT/tools/secret_scan.py"
 
+  make_clone_with_base "$TEST_ROOT/shim_clone" "$AESOP_ROOT/tools"
+  pushd "$TEST_ROOT/shim_clone" >/dev/null || exit 1
   shim_dir="$TEST_ROOT/py2shim_bin"
   mkdir -p "$shim_dir"
   # Broken `python`: simulates a Python-2-only interpreter hitting the
@@ -1205,6 +1246,7 @@ SHIM
         check_secret_scan
       ' <<< "$stdin_input" 2>&1
   )
+  popd >/dev/null
   rc=$?
 
   if [ $rc -eq 124 ]; then
@@ -1307,6 +1349,8 @@ if "--check" in sys.argv:
 sys.exit(0)
 SCRIPT
   chmod +x "$AESOP_ROOT/tools/gen_tool_index.py"
+  make_clone_with_base "$TEST_ROOT/gen_clone_1" "$AESOP_ROOT/tools"
+  cd "$TEST_ROOT/gen_clone_1" || exit 1
 
   # Create stub scripts for other gates so check_gen_tool_index doesn't fail before we test it
   for gate in tracker_guard import_resolution_check claudemd_sync_gate metrics_gate \
@@ -1343,6 +1387,8 @@ if "--check" in sys.argv:
 sys.exit(1)
 SCRIPT
   chmod +x "$AESOP_ROOT/tools/gen_tool_index.py"
+  make_clone_with_base "$TEST_ROOT/gen_clone_2" "$AESOP_ROOT/tools"
+  cd "$TEST_ROOT/gen_clone_2" || exit 1
 
   # Create stub scripts for other gates
   for gate in tracker_guard import_resolution_check claudemd_sync_gate metrics_gate \
@@ -1470,8 +1516,8 @@ printf '\n=== Test: check_emit_receipt is BOUNDED -- times out and fails open in
   stderr_output=$( { check_emit_receipt; } 2>&1 1>/dev/null )
   exit_code=$?
 
-  if [ "$exit_code" -ne 0 ]; then
-    printf 'FAIL: check_emit_receipt must fail-open (return 0) on timeout\n'
+  if [ "$exit_code" -ne 1 ]; then
+    printf 'FAIL: check_emit_receipt must BLOCK (return 1) on timeout: an unreadable conclusion is fail-closed\n'
     exit 1
   fi
   # Threshold is a wide 20s, not a tight bound on the 1s AESOP_RECEIPT_TIMEOUT:
@@ -1483,8 +1529,8 @@ printf '\n=== Test: check_emit_receipt is BOUNDED -- times out and fails open in
     printf 'FAIL: check_emit_receipt took %ds, did not actually bound the sleeping stub to ~1s\n' "$elapsed"
     exit 1
   fi
-  if ! printf '%s' "$stderr_output" | grep -qi 'WARN.*timed out'; then
-    printf 'FAIL: expected a one-line timeout WARN on stderr, got: %s\n' "$stderr_output"
+  if ! printf '%s' "$stderr_output" | grep -qi 'BLOCKED.*timed out'; then
+    printf 'FAIL: expected a BLOCKED timeout line on stderr, got: %s\n' "$stderr_output"
     exit 1
   fi
   audit_line=$(tail -n 1 "$AESOP_ROOT/state/SECURITY-AUDIT.log" 2>/dev/null)
@@ -1492,7 +1538,7 @@ printf '\n=== Test: check_emit_receipt is BOUNDED -- times out and fails open in
     printf 'FAIL: expected receipt_emit_timed_out audit event, got: %s\n' "$audit_line"
     exit 1
   fi
-  printf 'PASS: a slow matrix is bounded by AESOP_RECEIPT_TIMEOUT and fails open (elapsed %ds)\n' "$elapsed"
+  printf 'PASS: a slow matrix is bounded by AESOP_RECEIPT_TIMEOUT and blocks fail-closed (elapsed %ds)\n' "$elapsed"
 )
 if [ $? -eq 0 ]; then
   test_passed=$((test_passed + 1))
@@ -1669,25 +1715,106 @@ printf '\n=== Test: check_emit_receipt is BOUNDED without timeout binary (fallba
   # Re-run without trace to get stderr (need to get timing for elapsed check)
   start_ts=$(date +%s)
   stderr_output=$( { PATH="$test_path" check_emit_receipt; } 2>&1 1>/dev/null )
-  elapsed=$(( $(date +%s) - start_ts ))
   exit_code=$?
+  elapsed=$(( $(date +%s) - start_ts ))
 
-  if [ "$exit_code" -ne 0 ]; then
-    printf 'FAIL: check_emit_receipt must fail-open (return 0) on timeout even without timeout binary\n'
+  if [ "$exit_code" -ne 1 ]; then
+    printf 'FAIL: check_emit_receipt must BLOCK (return 1) on timeout even without timeout binary, got %s\n' "$exit_code"
     exit 1
   fi
   if [ "$elapsed" -gt 20 ]; then
     printf 'FAIL: check_emit_receipt took %ds without timeout binary, did not bound the sleeping stub\n' "$elapsed"
     exit 1
   fi
-  if ! printf '%s' "$stderr_output" | grep -qi 'WARN.*timed out'; then
-    printf 'FAIL: expected a timeout WARN on stderr, got: %s\n' "$stderr_output"
+  if ! printf '%s' "$stderr_output" | grep -qi 'BLOCKED.*timed out'; then
+    printf 'FAIL: expected a BLOCKED timeout line on stderr, got: %s\n' "$stderr_output"
     exit 1
   fi
   printf 'PASS: fallback branch (no timeout binary) is bounded (elapsed %ds)\n' "$elapsed"
 )
 if [ $? -eq 0 ]; then
   test_passed=$((test_passed + 1))
+else
+  test_failed=$((test_failed + 1))
+fi
+
+# Receipt conclusion gate (red blocks; skipped-with-reason and green pass; unreadable blocks;
+# AESOP_PUSH_RED=1 is the recorded override). emit_receipt.py is stubbed to the exit-code contract
+# it documents: 0 green, 3 red + --fail-on-red, 4 red + --pushed-red, anything else unreadable.
+RECEIPT_STUB_PRELUDE='import sys,os; open(os.environ["STUB_ARGV"],"w").write(" ".join(sys.argv[1:]));'
+
+receipt_gate_case() {
+  # $1 label  $2 stub python body  $3 expected return  $4 expected audit reason  $5 optional VAR=val
+  local label="$1" body="$2" want_rc="$3" want_reason="$4" extra="${5:-}"
+  local root="$TEST_ROOT/receipt_gate_$label"
+  mkdir -p "$root/state" "$root/tools" "$root/stub-bin"
+  printf '%s\n' "$body" > "$root/tools/emit_receipt.py"
+  printf '#!/bin/sh\nexit 0\n' > "$root/stub-bin/gh"
+  chmod +x "$root/stub-bin/gh"
+  touch "$root/dummy_key.pem"
+  (
+    export AESOP_ROOT="$root" AESOP_RECEIPT_KEY="$root/dummy_key.pem" STUB_ARGV="$root/argv.txt"
+    export PATH="$root/stub-bin:$PATH"
+    unset AESOP_RECEIPT_EMIT AESOP_RECEIPT_TIMEOUT AESOP_PUSH_RED
+    if [ -n "$extra" ]; then export "$extra"; fi
+    check_emit_receipt > "$root/stdout.txt" 2> "$root/stderr.txt"
+    echo $? > "$root/rc.txt"
+  )
+  local got_rc audit_line
+  got_rc=$(cat "$root/rc.txt")
+  audit_line=$(tail -n 1 "$root/state/SECURITY-AUDIT.log" 2>/dev/null)
+  if [ "$got_rc" != "$want_rc" ]; then
+    printf 'FAIL [%s]: check_emit_receipt returned %s, want %s; stderr: %s\n' "$label" "$got_rc" "$want_rc" "$(cat "$root/stderr.txt")"
+    return 1
+  fi
+  if [ "$want_reason" != "-" ] && ! printf '%s' "$audit_line" | grep -q "$want_reason"; then
+    printf 'FAIL [%s]: expected audit reason %s, got: %s\n' "$label" "$want_reason" "$audit_line"
+    return 1
+  fi
+  printf 'PASS [%s]: check_emit_receipt returned %s (reason %s)\n' "$label" "$got_rc" "$want_reason"
+  return 0
+}
+
+printf '\n=== Test: a RED required part blocks the push (emit_receipt exit 3) ===\n'
+if receipt_gate_case red_blocks "$RECEIPT_STUB_PRELUDE"'
+print("part py-shard-3 exit=1"); print("conclusion=failure"); sys.exit(3)' 1 receipt_red_blocked; then
+  # The hook must ask the emitter to block on red and must NOT pass the override by default.
+  if grep -q -- '--fail-on-red' "$TEST_ROOT/receipt_gate_red_blocks/argv.txt" && ! grep -q -- '--pushed-red' "$TEST_ROOT/receipt_gate_red_blocks/argv.txt"; then
+    test_passed=$((test_passed + 1))
+  else
+    printf 'FAIL: red case must pass --fail-on-red and no --pushed-red, got: %s\n' "$(cat "$TEST_ROOT/receipt_gate_red_blocks/argv.txt")"
+    test_failed=$((test_failed + 1))
+  fi
+else
+  test_failed=$((test_failed + 1))
+fi
+
+printf '\n=== Test: an all-green matrix is allowed ===\n'
+if receipt_gate_case all_green "$RECEIPT_STUB_PRELUDE"'
+print("conclusion=success"); sys.exit(0)' 0 receipt_emit_posted; then test_passed=$((test_passed + 1)); else test_failed=$((test_failed + 1)); fi
+
+printf '\n=== Test: a SKIPPED part with a printed reason is not red and is allowed ===\n'
+if receipt_gate_case skipped_reason "$RECEIPT_STUB_PRELUDE"'
+print("skip browser-proofs not runnable here: hosted browsers only"); print("conclusion=success"); sys.exit(0)' 0 receipt_emit_posted; then test_passed=$((test_passed + 1)); else test_failed=$((test_failed + 1)); fi
+
+printf '\n=== Test: an unreadable conclusion (emit_receipt exit 2) blocks ===\n'
+if receipt_gate_case unreadable_exit2 "$RECEIPT_STUB_PRELUDE"'
+print("ERROR: could not sign"); sys.exit(2)' 1 receipt_emit_unreadable_blocked; then test_passed=$((test_passed + 1)); else test_failed=$((test_failed + 1)); fi
+
+printf '\n=== Test: an unexpected emitter exit (1) blocks ===\n'
+if receipt_gate_case unexpected_exit1 "$RECEIPT_STUB_PRELUDE"'
+sys.exit(1)' 1 receipt_emit_unreadable_blocked; then test_passed=$((test_passed + 1)); else test_failed=$((test_failed + 1)); fi
+
+printf '\n=== Test: AESOP_PUSH_RED=1 allows a red push, loudly, and passes --pushed-red ===\n'
+if receipt_gate_case push_red_override "$RECEIPT_STUB_PRELUDE"'
+print("conclusion=failure pushed_red=true"); sys.exit(4)' 0 receipt_push_red_override AESOP_PUSH_RED=1; then
+  if grep -q -- '--pushed-red' "$TEST_ROOT/receipt_gate_push_red_override/argv.txt" \
+     && grep -q 'AESOP_PUSH_RED=1: pushing a RED head' "$TEST_ROOT/receipt_gate_push_red_override/stderr.txt"; then
+    test_passed=$((test_passed + 1))
+  else
+    printf 'FAIL: override must pass --pushed-red and print the loud AESOP_PUSH_RED line on stderr\n'
+    test_failed=$((test_failed + 1))
+  fi
 else
   test_failed=$((test_failed + 1))
 fi
@@ -1776,6 +1903,7 @@ printf '\n=== Test: main() emits a receipt only after every gate above it passed
   AESOP_ROOT_A="$TEST_ROOT/receipt_main_green_tools"
   build_repo "$REPO_A"
   build_tools "$AESOP_ROOT_A" 0
+  publish_base_tools "$REPO_A" "$AESOP_ROOT_A/tools"
   export AESOP_RECEIPT_KEY="$AESOP_ROOT_A/dummy_key.pem"
   touch "$AESOP_ROOT_A/dummy_key.pem"
   unset AESOP_RECEIPT_EMIT
@@ -1804,6 +1932,7 @@ printf '\n=== Test: main() emits a receipt only after every gate above it passed
   AESOP_ROOT_B="$TEST_ROOT/receipt_main_red_tools"
   build_repo "$REPO_B"
   build_tools "$AESOP_ROOT_B" 1
+  publish_base_tools "$REPO_B" "$AESOP_ROOT_B/tools"
   export AESOP_RECEIPT_KEY="$AESOP_ROOT_B/dummy_key.pem"
   touch "$AESOP_ROOT_B/dummy_key.pem"
 
@@ -1840,6 +1969,8 @@ printf '\n=== Test 29: check_pyflakes_ratchet blocks on baseline mismatch ===\n'
   # Stub pyflakes_gate.py that returns 1 (baseline mismatch)
   printf 'import sys\nsys.exit(1)\n' > "$AESOP_ROOT/tools/pyflakes_gate.py"
 
+  make_clone_with_base "$TEST_ROOT/pyflakes_t29_clone" "$AESOP_ROOT/tools"
+  cd "$TEST_ROOT/pyflakes_t29_clone" || exit 1
   if check_pyflakes_ratchet >/dev/null 2>&1; then
     printf 'FAIL: check_pyflakes_ratchet should block on baseline mismatch (exit 1)\n'
     exit 1
@@ -1861,6 +1992,8 @@ printf '\n=== Test 30: check_pyflakes_ratchet fails open when pyflakes not insta
   # Stub pyflakes_gate.py that returns 2 (pyflakes not installed / error condition)
   printf 'import sys\nsys.exit(2)\n' > "$AESOP_ROOT/tools/pyflakes_gate.py"
 
+  make_clone_with_base "$TEST_ROOT/pyflakes_t30_clone" "$AESOP_ROOT/tools"
+  cd "$TEST_ROOT/pyflakes_t30_clone" || exit 1
   if ! check_pyflakes_ratchet >/dev/null 2>&1; then
     printf 'FAIL: check_pyflakes_ratchet should fail-open when pyflakes is missing (return 0)\n'
     exit 1
@@ -1881,6 +2014,8 @@ printf '\n=== Test 31: check_pyflakes_ratchet skipped when tool missing from aes
 
   # Do NOT create pyflakes_gate.py; the tool should be considered missing
 
+  make_clone_with_base "$TEST_ROOT/pyflakes_t31_clone" "$AESOP_ROOT/tools"
+  cd "$TEST_ROOT/pyflakes_t31_clone" || exit 1
   if ! check_pyflakes_ratchet >/dev/null 2>&1; then
     printf 'FAIL: check_pyflakes_ratchet should fail-open (return 0) when tool missing\n'
     exit 1
@@ -1908,6 +2043,123 @@ printf '\n=== Test 32: check_pyflakes_ratchet honors AESOP_PYFLAKES_SKIP=1 ===\n
     exit 1
   fi
   printf 'PASS: check_pyflakes_ratchet honors AESOP_PYFLAKES_SKIP=1 opt-out\n'
+)
+if [ $? -eq 0 ]; then
+  test_passed=$((test_passed + 1))
+else
+  test_failed=$((test_failed + 1))
+fi
+
+# ===== REMOTE-REF POLICY: judge the pushed remote ref, not the local branch =====
+# git feeds pre-push stdin as "<local ref> <local sha> <remote ref> <remote sha>".
+# The verdict must follow the remote ref. Each case runs inside an isolated repo
+# whose checked-out (local) branch is set per case.
+policy_fixture_repo() {
+  # policy_fixture_repo <dir> <branch>: fresh repo with one commit, checked out on <branch>.
+  local dir="$1" branch="$2"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  git -C "$dir" init -q -b main
+  git -C "$dir" config user.email t@example.com
+  git -C "$dir" config user.name t
+  git -C "$dir" config core.autocrlf false
+  printf 'base\n' > "$dir/README.md"
+  git -C "$dir" add -A
+  git -C "$dir" commit -q -m base
+  if [ "$branch" != "main" ]; then
+    git -C "$dir" checkout -q -b "$branch"
+  fi
+}
+
+printf '\n=== Test 33: local main -> refs/heads/checkpoint/x is ALLOWED (remote ref is not protected) ===\n'
+(
+  repo="$TEST_ROOT/policy_main_to_checkpoint"
+  policy_fixture_repo "$repo" main
+  sha=$(git -C "$repo" rev-parse HEAD)
+  cd "$repo" || exit 1
+  printf 'refs/heads/main %s refs/heads/checkpoint/x 0000000000000000000000000000000000000000\n' "$sha" | {
+    check_branch_policy
+  }
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'FAIL: push from local main to refs/heads/checkpoint/x must be allowed, got rc %d\n' "$rc"
+    exit 1
+  fi
+  printf 'PASS: local main -> refs/heads/checkpoint/x allowed\n'
+)
+if [ $? -eq 0 ]; then
+  test_passed=$((test_passed + 1))
+else
+  test_failed=$((test_failed + 1))
+fi
+
+printf '\n=== Test 34: local feature/x -> refs/heads/main is BLOCKED ===\n'
+(
+  repo="$TEST_ROOT/policy_feature_to_main"
+  policy_fixture_repo "$repo" feature/x
+  sha=$(git -C "$repo" rev-parse HEAD)
+  cd "$repo" || exit 1
+  printf 'refs/heads/feature/x %s refs/heads/main 0000000000000000000000000000000000000000\n' "$sha" | {
+    check_branch_policy
+  }
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf 'FAIL: push from feature/x to refs/heads/main must be blocked, got rc 0\n'
+    exit 1
+  fi
+  printf 'PASS: local feature/x -> refs/heads/main blocked\n'
+)
+if [ $? -eq 0 ]; then
+  test_passed=$((test_passed + 1))
+else
+  test_failed=$((test_failed + 1))
+fi
+
+printf '\n=== Test 35: local main -> refs/heads/main is BLOCKED ===\n'
+(
+  repo="$TEST_ROOT/policy_main_to_main"
+  policy_fixture_repo "$repo" main
+  sha=$(git -C "$repo" rev-parse HEAD)
+  cd "$repo" || exit 1
+  printf 'refs/heads/main %s refs/heads/main 0000000000000000000000000000000000000000\n' "$sha" | {
+    check_branch_policy
+  }
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf 'FAIL: push from local main to refs/heads/main must be blocked, got rc 0\n'
+    exit 1
+  fi
+  printf 'PASS: local main -> refs/heads/main blocked\n'
+)
+if [ $? -eq 0 ]; then
+  test_passed=$((test_passed + 1))
+else
+  test_failed=$((test_failed + 1))
+fi
+
+printf '\n=== Test 36: local main -> refs/heads/master blocked; multi-ref with main tuple blocked; feature->feature from main checkout allowed ===\n'
+(
+  repo="$TEST_ROOT/policy_master_multi"
+  policy_fixture_repo "$repo" main
+  sha=$(git -C "$repo" rev-parse HEAD)
+  zeros="0000000000000000000000000000000000000000"
+  cd "$repo" || exit 1
+  printf 'refs/heads/main %s refs/heads/master %s\n' "$sha" "$zeros" | check_branch_policy
+  if [ $? -eq 0 ]; then
+    printf 'FAIL: push to refs/heads/master from local main must be blocked\n'
+    exit 1
+  fi
+  printf 'refs/heads/main %s refs/heads/checkpoint/y %s\nrefs/heads/main %s refs/heads/main %s\n' "$sha" "$zeros" "$sha" "$zeros" | check_branch_policy
+  if [ $? -eq 0 ]; then
+    printf 'FAIL: multi-ref push containing a refs/heads/main tuple must be blocked\n'
+    exit 1
+  fi
+  printf 'refs/heads/main %s refs/heads/feature/z %s\n' "$sha" "$zeros" | check_branch_policy
+  if [ $? -ne 0 ]; then
+    printf 'FAIL: local main -> refs/heads/feature/z must be allowed\n'
+    exit 1
+  fi
+  printf 'PASS: master blocked, multi-ref main tuple blocked, feature/z allowed from main checkout\n'
 )
 if [ $? -eq 0 ]; then
   test_passed=$((test_passed + 1))

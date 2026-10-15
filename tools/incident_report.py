@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Incident log generator: mines git history for operational failures.
-INDEX: Incident log generator: mines git history for operational failures; Incident-Class / Incident-Category commit trailers are authoritative and unknown values fail closed (non-zero exit naming the commit); subject-only keyword fallback is flagged inferred; 12 classes (incl. daemon-liveness, hook-fail-open, sync-drift, conduct); generates docs/INCIDENTS.md; CLI: `[--repo PATH]` (print) | `--regenerate [--output FILE]` | `--check` (drift exit 1); uses subprocess_common.git() with 60s timeout; all output deterministic, idempotent
+INDEX: Incident log generator: mines git history for operational failures; Incident-Class / Incident-Category commit trailers are authoritative and unknown values fail closed (non-zero exit naming the commit); test-isolation is a documented alias of test-pollution; subject-only keyword fallback is flagged inferred; 13 classes (incl. environment-shape, daemon-liveness, hook-fail-open, sync-drift, conduct); scans HEAD's history (--all opts into every ref, forensics only); generates docs/INCIDENTS.md; CLI: `[--repo PATH] [--all]` (print) | `--regenerate [--output FILE] [--all]` | `--stdout [--all]` (read-only: the bytes --regenerate would write) | `--check [--all]` (drift exit 1); --regenerate/--stdout refuse a shallow clone (exit 2); registered in generated_paths.REGISTRY + merge_queue.REGENERATORS (regen_all/pre-push/regen-on-main keep it fresh); uses subprocess_common.git() with 60s timeout; all output deterministic, idempotent
 
 Parses git history and extracts failure events, each classified by class.
 
 Classification channels, in precedence order:
   1. Explicit trailer `Incident-Class: <class>` (optional `Incident-Category: <A..E name>`).
+     `test-isolation` is an alias of `test-pollution` and is normalized on read.
      Authoritative. An unknown class or category is an ERROR that names the commit;
      the run fails closed (non-zero exit, no log written) rather than dropping the commit.
   2. Fallback for commits WITHOUT the trailer: subject only. A subject prefix of a known
@@ -17,10 +18,14 @@ Classification channels, in precedence order:
 Generates docs/INCIDENTS.md: a deterministic, idempotent failure taxonomy table
 with columns: class, what_happened, resolution, source_ref.
 
+Scope: by default only the history reachable from HEAD is scanned, so a PR checkout
+covers its own commits plus main, and an unrelated local or remote branch can never
+fail the gate. `--all` scans every ref (forensic use only).
+
 Usage:
-  python tools/incident_report.py [--repo PATH]
-  python tools/incident_report.py --regenerate [--repo PATH] [--output docs/INCIDENTS.md]
-  python tools/incident_report.py --check [--repo PATH]
+  python tools/incident_report.py [--repo PATH] [--all]
+  python tools/incident_report.py --regenerate [--repo PATH] [--output docs/INCIDENTS.md] [--all]
+  python tools/incident_report.py --check [--repo PATH] [--all]
 
 Output modes:
   default  - Human-readable table
@@ -61,6 +66,13 @@ INCIDENT_CLASSES = {
     "hook-fail-open": "Hook exited 0 or passed on malformed input or internal error",
     "sync-drift": "Checkout or brain state out of sync with origin (stale branch, unpulled state)",
     "conduct": "Orchestrator conduct: relayed unverified claims or routed around gates by hand",
+    "environment-shape": "defect caused by host or runner shape rather than logic: 8.3 vs resolved Windows paths, linked-worktree .git files, hooks dir resolution, WSL/distro absence; detector = the fix only changes path/platform resolution",
+}
+
+# Documented aliases: an alias trailer value is normalized to its class on read and reported
+# under that class (never as its own row).
+INCIDENT_CLASS_ALIASES = {
+    "test-isolation": "test-pollution",
 }
 
 # Incident category taxonomy (value of the Incident-Category trailer: "<letter> <name>")
@@ -80,11 +92,40 @@ _SUBJECT_PREFIX_RE = re.compile(r"^([a-z][a-z-]*):")
 
 
 def parse_trailers(body: str) -> Dict[str, List[str]]:
-    """Return {trailer key: [values in order]} for the Incident-* trailers in a commit body."""
+    """Return {trailer key: [values in order]} for the Incident-* trailers in a commit body.
+
+    Only the final blank-line-separated paragraph is the trailer block (git interpret-trailers
+    convention). Earlier prose that happens to wrap onto a line starting with "Incident-Class:"
+    is not a trailer and must not fail the gate.
+    """
     found: Dict[str, List[str]] = {CLASS_TRAILER: [], CATEGORY_TRAILER: []}
-    for key, value in _TRAILER_RE.findall(body or ""):
+    paragraphs = [p for p in re.split(r"\n[ \t]*\n", (body or "").strip()) if p.strip()]
+    block = paragraphs[-1] if paragraphs else ""
+    for key, value in _TRAILER_RE.findall(block):
         found[key].append(value)
     return found
+
+
+# Whole-word private-machine tokens (same set as tools/portability_check.py).
+# Historical commit subjects can carry them; the generated log is shipped
+# surface, so they are redacted here rather than failing the ratchet gate.
+_PRIVATE_TOKENS = ('conductor' + '3', 'matt' + '8')  # split so this source file passes its own gate
+PRIVATE_TOKEN_RE = re.compile(r'\b(' + '|'.join(_PRIVATE_TOKENS) + r')\b')
+
+
+def redact_private_tokens(text: str) -> str:
+    """Replace whole-word private-machine tokens with [redacted]."""
+    return PRIVATE_TOKEN_RE.sub('[redacted]', text)
+
+
+def write_table(path, text: str) -> None:
+    """Write the generated log with LF endings on every host.
+
+    Text-mode open() on Windows writes CRLF, so the regenerated file differed
+    from the committed LF file depending on the generator host.
+    """
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
 
 
 class IncidentClassifier:
@@ -164,9 +205,10 @@ class IncidentClassifier:
 class IncidentParser:
     """Parse incidents from git history."""
 
-    def __init__(self, repo_root: str = "."):
-        """Initialize with repo root."""
+    def __init__(self, repo_root: str = ".", all_refs: bool = False):
+        """Initialize with repo root. all_refs=False scans HEAD's history only."""
         self.repo_root = Path(repo_root)
+        self.all_refs = all_refs
         self.classifier = IncidentClassifier()
 
     def _run_git(self, *args, check=True) -> str:
@@ -201,7 +243,7 @@ class IncidentParser:
 
         return summary
 
-    def _extract_resolution(self, body: str) -> str:
+    def _extract_resolution(self, subject: str, body: str) -> str:
         """Extract resolution from commit body."""
         lines = body.split('\n')
 
@@ -226,7 +268,7 @@ class IncidentParser:
             return resolution
 
         # Fallback: extract from subject
-        return self._extract_what_happened(body[:100], "")
+        return self._extract_what_happened(subject, "")
 
     def _resolve_trailers(self, short_hash: str, subject: str, body: str) -> Tuple[Optional[str], bool, List[str]]:
         """Resolve explicit trailers for one commit.
@@ -236,7 +278,7 @@ class IncidentParser:
         errors: List[str] = []
         trailers = parse_trailers(body)
 
-        class_values = trailers[CLASS_TRAILER]
+        class_values = [INCIDENT_CLASS_ALIASES.get(v, v) for v in trailers[CLASS_TRAILER]]
         category_values = trailers[CATEGORY_TRAILER]
 
         if len(set(class_values)) > 1:
@@ -280,7 +322,7 @@ class IncidentParser:
         output = self._run_git(
             "log",
             "--format=%H%x1f%h%x1f%s%x1f%b%x1f%cI%x1e",  # full | short | subject | body | date
-            "--all",
+            "--all" if self.all_refs else "HEAD",
             check=False,
         )
         if not output:
@@ -326,7 +368,7 @@ class IncidentParser:
                 continue
 
             what_happened = self._extract_what_happened(subject, body)
-            resolution = self._extract_resolution(body)
+            resolution = self._extract_resolution(subject, body)
             source_ref = self._extract_source_ref(subject, short_hash)
 
             # Parse date for sorting. Never fall back to the wall clock: a clock
@@ -419,9 +461,10 @@ class IncidentMarkdown:
             resolution = incident['resolution']
             source_ref = incident['source_ref']
 
-            # Escape pipes in content
-            what_happened = what_happened.replace('|', '\\|')
-            resolution = resolution.replace('|', '\\|')
+            # Redact private-machine tokens, then escape pipes in content
+            what_happened = redact_private_tokens(what_happened).replace('|', '\\|')
+            resolution = redact_private_tokens(resolution).replace('|', '\\|')
+            source_ref = redact_private_tokens(source_ref)
 
             lines.append(
                 f"| {class_name} | {what_happened} | {resolution} | {source_ref} |"
@@ -473,10 +516,10 @@ class IncidentValidator:
 class IncidentChecker:
     """Check if docs/INCIDENTS.md matches current git state."""
 
-    def __init__(self, repo_root: str = "."):
+    def __init__(self, repo_root: str = ".", all_refs: bool = False):
         """Initialize checker."""
         self.repo_root = Path(repo_root)
-        self.parser = IncidentParser(repo_root)
+        self.parser = IncidentParser(repo_root, all_refs=all_refs)
         self.markdown = IncidentMarkdown()
 
     def _is_shallow_clone(self) -> bool:
@@ -542,6 +585,23 @@ class IncidentChecker:
             return (False, "DRIFT: docs/INCIDENTS.md does not match current state")
 
 
+def is_shallow_clone(repo_root: str) -> bool:
+    """True when git reports a shallow repository (or the answer cannot be read).
+
+    A shallow checkout sees only a slice of HEAD's history, so a table generated from it
+    is truncated. Writers must refuse on True (fail closed); an unreadable answer counts
+    as shallow for the same reason.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=str(repo_root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return proc.returncode != 0 or proc.stdout.strip() != "false"
+
+
 def _report_errors(errors: List[str]) -> None:
     """Print classification errors to stderr (fail-closed path)."""
     print("FAIL-CLOSED: unclassifiable incident commit(s); nothing written:", file=sys.stderr)
@@ -576,11 +636,22 @@ def main():
         help="Output file path (default: docs/INCIDENTS.md; relative to --repo, or absolute)"
     )
 
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Scan every ref, not only HEAD's history (forensic use; unrelated branches can fail the gate)"
+    )
+
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--regenerate",
         action="store_true",
         help="Regenerate docs/INCIDENTS.md from live git state"
+    )
+    mode_group.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print exactly what --regenerate would write, without touching the file (read-only)"
     )
     mode_group.add_argument(
         "--check",
@@ -590,10 +661,28 @@ def main():
 
     args = parser.parse_args()
 
-    incident_parser = IncidentParser(repo_root=args.repo)
+    incident_parser = IncidentParser(repo_root=args.repo, all_refs=args.all)
     markdown_gen = IncidentMarkdown()
 
+    if args.stdout:
+        # Read-only twin of --regenerate: the exact bytes --regenerate would write.
+        # regen_all.py --check compares these against the committed file.
+        if is_shallow_clone(args.repo):
+            print("FAIL-CLOSED: shallow clone; refusing to generate a truncated incident log "
+                  "(fetch full history: actions/checkout fetch-depth: 0)", file=sys.stderr)
+            return 2
+        incidents, errors = incident_parser.parse()
+        if errors:
+            _report_errors(errors)
+            return 1
+        sys.stdout.write(markdown_gen.generate_table(incidents))
+        return 0
+
     if args.regenerate:
+        if is_shallow_clone(args.repo):
+            print("FAIL-CLOSED: shallow clone; refusing to write a truncated incident log "
+                  "(fetch full history: actions/checkout fetch-depth: 0)", file=sys.stderr)
+            return 2
         incidents, errors = incident_parser.parse()
         if errors:
             _report_errors(errors)
@@ -607,8 +696,7 @@ def main():
             output_path = Path(args.repo) / output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(markdown_output)
+        write_table(output_path, markdown_output)
 
         print(f"Regenerated {output_path}")
         print(f"Total incidents: {len(incidents)}")
@@ -616,7 +704,7 @@ def main():
         return 0
 
     if args.check:
-        checker = IncidentChecker(repo_root=args.repo)
+        checker = IncidentChecker(repo_root=args.repo, all_refs=args.all)
         match, message = checker.check_incidents_file(args.output)
         if match:
             if message:

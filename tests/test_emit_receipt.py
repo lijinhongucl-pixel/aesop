@@ -200,6 +200,63 @@ class TestRunMatrix(unittest.TestCase):
         self.assertEqual(emit.conclusion_for([{"exit_code": 0}, {"exit_code": 1}]), "failure")
 
 
+class TestWslRequiredPart(unittest.TestCase):
+    """A part marked requires_wsl is skipped (not failed) when no WSL distro exists,
+    and fails closed when the WSL probe itself errors."""
+
+    OK_CMD = [sys.executable, "-c", "import sys; sys.exit(0)"]
+    BAD_CMD = [sys.executable, "-c", "import sys; sys.exit(1)"]
+
+    def _registry(self):
+        return {
+            "good": emit.PartSpec(lambda repo: self.OK_CMD),
+            "linux-shape": emit.PartSpec(lambda repo: self.BAD_CMD, requires_wsl=True),
+        }
+
+    def _run(self, status):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _mk_repo(tmp)
+            return emit.run_matrix(repo, ["good", "linux-shape"], registry=self._registry(), jobs=1,
+                                   wsl_status_fn=lambda: status)
+
+    def test_no_distro_skips_wsl_part_and_conclusion_stays_success(self):
+        parts, skipped = self._run("no-distro")
+        self.assertEqual([p["name"] for p in parts], ["good"])
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["name"], "linux-shape")
+        self.assertIn("WSL", skipped[0]["reason"])
+        self.assertEqual(emit.conclusion_for(parts), "success")
+
+    def test_absent_wsl_also_skips_wsl_part(self):
+        parts, skipped = self._run("absent")
+        self.assertEqual([p["name"] for p in parts], ["good"])
+        self.assertEqual(skipped[0]["name"], "linux-shape")
+        self.assertEqual(emit.conclusion_for(parts), "success")
+
+    def test_probe_error_runs_wsl_part_and_fails_closed(self):
+        parts, skipped = self._run("error")
+        self.assertEqual(skipped, [])
+        by = {p["name"]: p for p in parts}
+        self.assertEqual(by["linux-shape"]["exit_code"], 1)
+        self.assertEqual(emit.conclusion_for(parts), "failure")
+
+    def test_ok_wsl_runs_part_and_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _mk_repo(tmp)
+            registry = {"linux-shape": emit.PartSpec(lambda r: self.OK_CMD, requires_wsl=True)}
+            parts, skipped = emit.run_matrix(repo, ["linux-shape"], registry=registry, jobs=1,
+                                             wsl_status_fn=lambda: "ok")
+        self.assertEqual(skipped, [])
+        self.assertEqual(parts[0]["exit_code"], 0)
+        self.assertEqual(emit.conclusion_for(parts), "success")
+
+    def test_default_registry_declares_linux_shape_part_requiring_wsl(self):
+        spec = emit.DEFAULT_REGISTRY["linux-shape"]
+        self.assertTrue(spec.requires_wsl)
+        self.assertIsNotNone(spec.cmd)
+        self.assertIn("--require-wsl", spec.cmd(TOOLS.parent))
+
+
 class TestCliDryRunAndPost(unittest.TestCase):
     def _registry(self):
         ok = [sys.executable, "-c", "print('Ran 2 tests in 0.00s')"]
@@ -264,6 +321,86 @@ class TestCliDryRunAndPost(unittest.TestCase):
             code = emit.main(["--repo", str(repo), "--matrix", "py-shard-0", "--scheme", "hmac-sha256",
                               "--slug", "o/r", "--dry-run"], registry=self._registry(), gh_runner=None, environ={})
             self.assertEqual(code, 2)
+
+
+class TestRedGateExitCodes(unittest.TestCase):
+    """--fail-on-red / --pushed-red: the exit code the pre-push hook reads (docs/RECEIPT-GATE.md).
+
+    0 = green (or red without --fail-on-red: legacy contract), 3 = red and blocked,
+    4 = red, override accepted, receipt stamped pushed_red: true. Red is any part exit != 0;
+    skipped parts (reason printed, never in `parts`) never make a receipt red.
+    """
+
+    OK = [sys.executable, "-c", "print('Ran 2 tests in 0.00s')"]
+    BAD = [sys.executable, "-c", "import sys; print('FAILED one'); sys.exit(1)"]
+
+    def _registry(self, red):
+        return {"py-shard-0": emit.PartSpec(lambda repo: self.OK),
+                "py-shard-1": emit.PartSpec(lambda repo: self.BAD if red else self.OK),
+                "browser-proofs": emit.PartSpec(None, "not runnable here: hosted browsers only")}
+
+    def _run(self, tmp, red, extra):
+        posted = []
+
+        def gh(args):
+            # The check-run payload file is deleted after the call: capture its JSON while it exists.
+            if "--input" in args:
+                posted.append(json.loads(Path(args[-1]).read_text(encoding="utf-8")))
+            return (0, "{}", "")
+
+        repo = _mk_repo(tmp)
+        out = Path(tmp) / "env.json"
+        argv = ["--repo", str(repo), "--matrix", "py-shard-0,py-shard-1,browser-proofs", "--scheme", "hmac-sha256",
+                "--slug", "o/r", "--post", "--out", str(out)] + extra
+        code = emit.main(argv, registry=self._registry(red), gh_runner=gh,
+                         environ={"AESOP_RECEIPT_HMAC_SECRET": _hmac_secret()})
+        return code, json.loads(out.read_text(encoding="utf-8")), posted
+
+    def test_red_required_part_blocks_with_exit_3_and_still_posts_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, env_json, posted = self._run(tmp, red=True, extra=["--fail-on-red"])
+        self.assertEqual(code, 3)
+        # The red record is still published: the trace of the red push attempt survives.
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["conclusion"], "failure")
+        self.assertNotIn("pushed_red", env_json["receipt"])
+
+    def test_all_green_is_allowed_exit_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, env_json, posted = self._run(tmp, red=False, extra=["--fail-on-red"])
+        self.assertEqual(code, 0)
+        self.assertEqual(posted[0]["conclusion"], "success")
+        self.assertNotIn("pushed_red", env_json["receipt"])
+
+    def test_skipped_with_reason_is_not_red_exit_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, env_json, _ = self._run(tmp, red=False, extra=["--fail-on-red"])
+        self.assertEqual(code, 0)
+        self.assertEqual([s["name"] for s in env_json["receipt"]["skipped"]], ["browser-proofs"])
+
+    def test_red_without_fail_on_red_keeps_legacy_exit_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, _ = self._run(tmp, red=True, extra=[])
+        self.assertEqual(code, 0)
+
+    def test_pushed_red_override_exit_4_and_stamps_signed_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, env_json, _ = self._run(tmp, red=True, extra=["--fail-on-red", "--pushed-red"])
+        self.assertEqual(code, 4)
+        self.assertIs(env_json["receipt"]["pushed_red"], True)
+        # The stamp is inside the signed bytes: the signature verifies over the stamped receipt...
+        self.assertTrue(rc.verify_signature(rc.canonical_json(env_json["receipt"]), env_json["sig"],
+                                            hmac_secret=_hmac_secret()))
+        # ...and flipping it breaks the signature (it is not a free-floating label).
+        tampered = dict(env_json["receipt"], pushed_red=False)
+        self.assertFalse(rc.verify_signature(rc.canonical_json(tampered), env_json["sig"],
+                                             hmac_secret=_hmac_secret()))
+
+    def test_pushed_red_on_green_is_exit_0_without_stamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, env_json, _ = self._run(tmp, red=False, extra=["--fail-on-red", "--pushed-red"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("pushed_red", env_json["receipt"])
 
 
 if __name__ == "__main__":

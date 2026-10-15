@@ -747,7 +747,9 @@ class TestFixtureImmutability(unittest.TestCase):
 
             # Parse git status output and check for modified/new files in risky areas
             dirty_files = []
-            for line in status_output.strip().split("\n"):
+            # rstrip, not strip: porcelain lines start with a status column that may be a
+            # leading space (" M path"); strip() would eat it and shift line[3:] off by one.
+            for line in status_output.rstrip("\n").split("\n"):
                 if not line.strip():
                     continue
 
@@ -760,7 +762,13 @@ class TestFixtureImmutability(unittest.TestCase):
 
                 # Risky patterns: modified or new files in tests/fixtures/ or repo root
                 # but allow safe temp patterns (already cleaned up)
-                if "tests/fixtures/" in filepath:
+                if status_code != "??" and "/" not in filepath:
+                    # Any TRACKED root file modified or deleted by a test, dot-prefixed
+                    # ones included (e.g. .widget-baseline.json): a test may never edit a
+                    # committed root file. Untracked ("??") root files are left to the
+                    # cache/ignore allowlist below.
+                    dirty_files.append(filepath)
+                elif "tests/fixtures/" in filepath:
                     # tests/fixtures/ should NEVER be modified by tests
                     dirty_files.append(filepath)
                 elif filepath.count("/") == 0 and filepath not in [
@@ -797,6 +805,84 @@ class TestFixtureImmutability(unittest.TestCase):
                 f"Error checking fixture immutability: {exc}. "
                 f"Cannot verify git status; failing closed."
             )
+
+
+def _is_sys_modules_subscript(node):
+    return (isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "modules"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "sys")
+
+
+def _sys_modules_delete_offenders(source):
+    """Return line numbers of `del sys.modules[...]` with no restoration in the same function.
+
+    Restoration = a try/finally, a `with` block, or an addCleanup call in the enclosing
+    function (module-level deletes always count as offenders).
+    """
+    tree = ast.parse(source)
+    offenders = []
+    for stmt in tree.body:  # top-level statements only; functions are judged below
+        if isinstance(stmt, ast.Delete) and any(_is_sys_modules_subscript(t) for t in stmt.targets):
+            offenders.append(stmt.lineno)
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        deletes = [n for n in ast.walk(func)
+                   if isinstance(n, ast.Delete)
+                   and any(_is_sys_modules_subscript(t) for t in n.targets)]
+        if not deletes:
+            continue
+        restores = any(
+            isinstance(n, ast.With)
+            or (isinstance(n, ast.Try) and n.finalbody)
+            or (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "addCleanup")
+            for n in ast.walk(func))
+        if not restores:
+            offenders.extend(d.lineno for d in deletes)
+    return sorted(set(offenders))
+
+
+class TestSysModulesRestoration(unittest.TestCase):
+    """Tests that mutate sys.modules must restore it (a swapped `config` leaks process-wide)."""
+
+    def test_sys_modules_delete_is_checker_flags_unrestored_and_passes_restored(self):
+        unrestored = (
+            "import sys\n"
+            "def load():\n"
+            "    del sys.modules['config']\n"
+            "    import config\n"
+            "    return config\n")
+        restored = (
+            "import sys\n"
+            "def load():\n"
+            "    saved = sys.modules.get('config')\n"
+            "    try:\n"
+            "        del sys.modules['config']\n"
+            "        import config\n"
+            "        return config\n"
+            "    finally:\n"
+            "        sys.modules['config'] = saved\n")
+        self.assertEqual(_sys_modules_delete_offenders(unrestored), [3])
+        self.assertEqual(_sys_modules_delete_offenders(restored), [])
+
+    def test_repo_tests_delete_sys_modules_only_with_restoration(self):
+        """Every tests/**/*.py must delete sys.modules entries only under a restoring try/finally,
+        with, or addCleanup (AST check, not a text grep). A leaked deletion leaves a sibling
+        module's `config` binding stale for the rest of the shard process."""
+        tests_dir = Path(__file__).parent
+        offenders = {}
+        for path in sorted(tests_dir.rglob("*.py")):
+            lines = _sys_modules_delete_offenders(path.read_text(encoding="utf-8"))
+            if lines:
+                offenders[path.relative_to(tests_dir).as_posix()] = lines
+        self.assertEqual(
+            offenders, {},
+            "del sys.modules[...] without restoration (file: lines) -> "
+            + "; ".join(f"{name}: {', '.join(str(n) for n in lines)}"
+                        for name, lines in offenders.items()))
 
 
 if __name__ == "__main__":

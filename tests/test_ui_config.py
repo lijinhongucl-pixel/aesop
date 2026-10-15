@@ -16,13 +16,37 @@ import sys
 import tempfile
 import shutil
 import unittest
+
+from tests.sys_modules_restore import snapshot_sys_modules
 from pathlib import Path
+
+# Env the config module resolves paths from. A shell that exports any of these (lane
+# worktrees export AESOP_STATE_ROOT) silently re-points STATE_DIR and the heartbeat
+# chain, so every class here snapshots, clears, and restores them around each test.
+CONFIG_ENV_KEYS = ("AESOP_ROOT", "AESOP_STATE_ROOT", "AESOP_TRANSCRIPTS_ROOT",
+                   "AESOP_CONDUCTOR3_ROOT", "AESOP_WATCHDOG_HEARTBEAT",
+                   "AESOP_MONITOR_HEARTBEAT", "PORT")
+
+
+def _scrub_config_env():
+    """Clear every config-resolution env var; return the snapshot for _restore_config_env."""
+    return {k: os.environ.pop(k, None) for k in CONFIG_ENV_KEYS}
+
+
+def _restore_config_env(saved):
+    """Put back exactly the env captured by _scrub_config_env (unset stays unset)."""
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 class TestAesopRootResolution(unittest.TestCase):
     """Test cases for AESOP_ROOT fallback tier resolution."""
 
     def setUp(self):
+        self.addCleanup(snapshot_sys_modules("ui.config", "ui"))
         """Create temporary fixture directory structure."""
         self.fixture_root = tempfile.mkdtemp(prefix="aesop-config-test-")
         self.state_dir = os.path.join(self.fixture_root, "state")
@@ -30,44 +54,15 @@ class TestAesopRootResolution(unittest.TestCase):
         os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.ui_dir, exist_ok=True)
 
-        # Save original env
-        self.orig_aesop_root = os.environ.get("AESOP_ROOT")
-        self.orig_port = os.environ.get("PORT")
-        self.orig_aesop_state_root = os.environ.get("AESOP_STATE_ROOT")
-        self.orig_aesop_transcripts_root = os.environ.get("AESOP_TRANSCRIPTS_ROOT")
+        self._saved_env = _scrub_config_env()
 
     def tearDown(self):
         """Clean up temporary fixture and restore environment."""
-        # Restore original env
-        if self.orig_aesop_root is not None:
-            os.environ["AESOP_ROOT"] = self.orig_aesop_root
-        elif "AESOP_ROOT" in os.environ:
-            del os.environ["AESOP_ROOT"]
-
-        if self.orig_port is not None:
-            os.environ["PORT"] = self.orig_port
-        elif "PORT" in os.environ:
-            del os.environ["PORT"]
-
-        if self.orig_aesop_state_root is not None:
-            os.environ["AESOP_STATE_ROOT"] = self.orig_aesop_state_root
-        elif "AESOP_STATE_ROOT" in os.environ:
-            del os.environ["AESOP_STATE_ROOT"]
-
-        if self.orig_aesop_transcripts_root is not None:
-            os.environ["AESOP_TRANSCRIPTS_ROOT"] = self.orig_aesop_transcripts_root
-        elif "AESOP_TRANSCRIPTS_ROOT" in os.environ:
-            del os.environ["AESOP_TRANSCRIPTS_ROOT"]
+        _restore_config_env(self._saved_env)
 
         # Clean up temp dir
         if os.path.exists(self.fixture_root):
             shutil.rmtree(self.fixture_root)
-
-        # Remove cached config module if it exists
-        if "ui.config" in sys.modules:
-            del sys.modules["ui.config"]
-        if "ui" in sys.modules:
-            del sys.modules["ui"]
 
     def _load_config_module(self, fixture_root=None):
         """Dynamically import config.py, optionally with fixture AESOP_ROOT and UI location.
@@ -90,6 +85,7 @@ class TestAesopRootResolution(unittest.TestCase):
             with open(fixture_config_py, "w") as f:
                 f.write(config_content)
 
+        self.addCleanup(snapshot_sys_modules("ui.config", "ui"))
         # Remove cached config module if it exists
         if "ui.config" in sys.modules:
             del sys.modules["ui.config"]
@@ -285,6 +281,7 @@ class TestHeartbeatPathResolution(unittest.TestCase):
     """Test cases for heartbeat path fallback chain resolution."""
 
     def setUp(self):
+        self.addCleanup(snapshot_sys_modules("ui.config", "ui"))
         """Create temporary fixture directory structure."""
         self.fixture_root = tempfile.mkdtemp(prefix="aesop-hb-test-")
         self.state_dir = os.path.join(self.fixture_root, "state")
@@ -295,42 +292,15 @@ class TestHeartbeatPathResolution(unittest.TestCase):
         os.makedirs(self.conductor3_state, exist_ok=True)
         os.makedirs(self.conductor3_monitor, exist_ok=True)
 
-        # Save original env
-        self.orig_aesop_root = os.environ.get("AESOP_ROOT")
-        self.orig_hb_env = os.environ.get("AESOP_WATCHDOG_HEARTBEAT")
-        self.orig_mhb_env = os.environ.get("AESOP_MONITOR_HEARTBEAT")
-        self.orig_conductor3_root = os.environ.get("AESOP_CONDUCTOR3_ROOT")
+        self._saved_env = _scrub_config_env()
 
     def tearDown(self):
         """Clean up temporary fixture and restore environment."""
-        # Restore original env
-        if self.orig_aesop_root is not None:
-            os.environ["AESOP_ROOT"] = self.orig_aesop_root
-        elif "AESOP_ROOT" in os.environ:
-            del os.environ["AESOP_ROOT"]
-
-        if self.orig_hb_env is not None:
-            os.environ["AESOP_WATCHDOG_HEARTBEAT"] = self.orig_hb_env
-        elif "AESOP_WATCHDOG_HEARTBEAT" in os.environ:
-            del os.environ["AESOP_WATCHDOG_HEARTBEAT"]
-
-        if self.orig_mhb_env is not None:
-            os.environ["AESOP_MONITOR_HEARTBEAT"] = self.orig_mhb_env
-        elif "AESOP_MONITOR_HEARTBEAT" in os.environ:
-            del os.environ["AESOP_MONITOR_HEARTBEAT"]
-
-        if self.orig_conductor3_root is not None:
-            os.environ["AESOP_CONDUCTOR3_ROOT"] = self.orig_conductor3_root
-        elif "AESOP_CONDUCTOR3_ROOT" in os.environ:
-            del os.environ["AESOP_CONDUCTOR3_ROOT"]
+        _restore_config_env(self._saved_env)
 
         # Clean up temp dir
         if os.path.exists(self.fixture_root):
             shutil.rmtree(self.fixture_root)
-
-        # Remove cached config module
-        if "ui.config" in sys.modules:
-            del sys.modules["ui.config"]
 
     def _load_config_module_with_conductor3(self, fixture_root):
         """Load config with AESOP_ROOT set to fixture_root and conductor3 in fixture."""
@@ -351,6 +321,7 @@ class TestHeartbeatPathResolution(unittest.TestCase):
         with open(fixture_config_py, "w") as f:
             f.write(config_content)
 
+        self.addCleanup(snapshot_sys_modules("ui.config", "ui"))
         # Remove cached config module
         if "ui.config" in sys.modules:
             del sys.modules["ui.config"]
