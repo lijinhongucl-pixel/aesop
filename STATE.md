@@ -8,7 +8,8 @@
 
 - BOUND with gh at 14:05Z: #1012 MERGED 49d2c5c6, #1028 MERGED bc902245, #1029 MERGED 541157f7, #1030 MERGED 0fb23795 (= origin/main). main-full success on 541157f7; main-full on 0fb23795 in progress at bind. Earlier DONE: #1027 d5f07bdf, #1026, claude-config #20 #21.
 - Required checks on main (gh api branch protection): ci (0) ci (1) ci (2) ci (3), windows, pr-footprint-gate, pr-symbol-survival. verify-receipt is NOT required and is red on #1031 #1025 #1020 (base-trust problem; #1020 is its fix).
-- #1031 fix/incidents-md-drift (head f4f8c11c, auto-merge armed): only waiting on ci (0) at bind; expect MERGED without action.
+- #1031 MERGED 4491ffe0 (bound 14:12Z). Lane report: incident-report-gate was NOT red on main (drift is per-PR: a PR whose subjects add incident rows drifts until it regenerates); CURRENT-block defects 2, 3, 5 are not live and 4 is not a contradiction (mutant-backed tests exist in tests/test_incident_report.py); 27 ImportError skip guards and two assertTrue(True) placeholders removed. DECISION QUEUED: incident-report-gate is non-required and per-PR drift recurs; options are a regen-on-PR step or comparing against the merge base.
+- NEXT STEPS item 18 (promote G13) is DONE: pr-symbol-survival is already in the required check set (bound via branch protection 14:05Z).
 - The pre-clear C7 merge-main lane did NOT finish: #1025 #1020 #1014 #1011 were all mergeStateStatus DIRTY at bind. Re-dispatched as four separate github-agent haiku lanes (worktrees aesop-wt-1025/1020/1014/1011; three-way conflict resolution; regen for INDEX.md/INCIDENTS.md; push; auto-merge; verify MERGED).
 - DISPATCHED 14:05Z (10 haiku lanes total; verify each claim by literal PR number before restating):
   1. claude-scripts fix/auto-clear-context-fallback (python-pro): auto_clear.py --check fallback to transcript JSONL, same formula as main-context-ceiling.mjs, fail closed naming both paths.
