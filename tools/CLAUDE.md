@@ -112,7 +112,7 @@ escape hatch set for the dry run; stale -> FAIL with the exact regen command, ne
 - `linux_shape_check.py` — WSL-based cross-platform test gate: detects commits touching
   shell/workflow/Node files, runs test suites under WSL to catch Windows-only CI reds
   (e.g., isolated-home USERPROFILE assumptions, shell failures on Ubuntu). Wired into
-  pre-push-policy.sh after generated_paths check. Tests: 17 unit cases covering skip/ notice/fail/require-wsl scenarios.
+  pre-push-policy.sh after generated_paths check. Tests: 17 unit cases covering skip/ notice/fail/require-wsl scenarios. Receipt part `linux-shape` (`requires_wsl`) is skipped when WSL is absent/no-distro; a probe error fails closed.
 
 ## Gates & tests
 - `secret_scan.py --staged` — pre-push gate (exit 0=clean/1=findings/2=error; `# secretscan: allow-pattern-docs` pragma softens only `env_access` (never `generic_secret_assignment` or `generic_credential_assignment`: the pragma is self-asserted, so it cannot launder a real credential; doc examples use a placeholder value that each rule's own placeholder check excuses); `generic_credential_assignment` flags `KEY_NAME=value`/`KEY: value`/`KEY = "value"` outside .env files; NUL/UTF-16 files are decoded and scanned in full; files over 16 MiB fail closed)
