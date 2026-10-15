@@ -4,6 +4,14 @@
 
 **Current Version:** v0.9.1 (tag 5026195d, cut 2026-10-09; GitHub release published 2026-10-10; npm @matt82198/aesop 0.9.1; 40 PRs since v0.9.0). Previous: v0.9.0 (2026-10-07).
 
+## CI-TO-GREEN QUEUE (2026-10-15 ~13:40Z, ceiling checkpoint; BUILDLOG has the ledger)
+
+- DONE: #1027 MERGED (d5f07bdf) doctor git-2.56 wording; main-full 38743443664 success. claude-config #20 #21 MERGED, brain ff-pulled. #1026 MERGED. Memory index OK (22983 B). conductor3 BUILDLOG rotated.
+- IN FLIGHT (verify by literal PR number before restating): C7 lane merging main into #1025 #1020 #1014 #1011 (github-agent sonnet); #1012 lane (python-pro sonnet); guard-fix lane fix/generated-path-guard-merge-carried (haiku, was waiting on checks); incidents lane fix/incidents-md-drift (haiku, incident-report-gate red on main, STATE defects 1-5).
+- LANE CLAIM, UNVERIFIED at ceiling (bind with gh pr view 1012 / 1029 first thing after clear): #1012 MERGED as 49d2c5c6 at head efb71b6a (3 symbols restored: _SCRUBBED_PART_ENV, scrubbed_part_env, TestMatrixPartEnvScrub; watcher loop bounded; pushed once with AESOP_ALLOW_GENERATED=1 for the new-tool INDEX.md case). Follow-up #1029 MERGED (docs/INCIDENTS.md regenerated), so incident-report-gate may already be green on main; the incidents lane must re-check before changing INCIDENTS.md and still fix defects 2-5. verify-receipt red from local shard failures (test_isolation_tripwire: ~/.claude/memory changed during run, i.e. memory keeper interference; unproven). Worktree aesop-wt-rcflush left in place.
+- BLOCKED: #1018 fixture fix is local only (5980725a in aesop-wt-1018, 11/11 tests) because generated-paths guard blocks merge-carried tools/INDEX.md. After guard fix merges: resume lane in wt-1018 to merge main + push.
+- QUEUED: #997 merge main after guard fix (windows red was C1). NEXT STEPS (a) receipts design after #1020 merges. Decide whether incident-report-gate should be required.
+
 ## CURRENT (2026-10-14 mid-wave checkpoint)
 
 **Mid-wave checkpoint, round 1 audit + fix wave.** Every fact below was verified with `gh`/`git` at write time (2026-10-15 ~01:07Z, Mattt box). PR states move; re-verify before acting. Companion ledger: BUILDLOG.md section "2026-10-14 mid-wave checkpoint".
