@@ -531,9 +531,12 @@ class AsciiScopeTest(unittest.TestCase):
     baselined file that became clean is a stale-entry finding.
     """
 
-    # Non-ASCII tools/*.py files when the ratchet was introduced. The baseline
-    # may shrink freely; raising this ceiling needs a measured reason.
-    BASELINE_CEILING = 102
+    # Non-ASCII tools/*.py files when the ratchet was introduced (102), plus the
+    # 5 .github/workflows/*.yml files that already held non-ASCII when workflow
+    # YAML joined the scope on 2026-10-15 (ci 10, crossos-drift 3, main-full 3,
+    # publish 4, reproduce 2 = 22 characters, measured by _count_non_ascii).
+    # The baseline may shrink freely; raising this ceiling needs a measured reason.
+    BASELINE_CEILING = 107
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -595,7 +598,7 @@ class AsciiScopeTest(unittest.TestCase):
     def test_malformed_baselines_fail_closed(self):
         self._write("tools/x.py", "# a — b\n")
         bad_bodies = [
-            '{"files": ["tools/x.py"]}',                      # old plain-list format
+            '{"files": ["tools/x.py", 3]}',                   # list with a non-string entry
             '{"files": {"tools/x.py": -1}}',                  # negative count
             '{"files": {"tools/x.py": true}}',                # bool is not a count
             '{"files": {"tools/x.py": 1.5}}',                 # non-integer count
@@ -643,6 +646,18 @@ class AsciiScopeTest(unittest.TestCase):
         self._write("tools/sub/y.py", "# a — b\n")
         self.assertEqual(el.ascii_findings(self.root), [])
 
+    def test_github_workflow_yaml_is_in_ascii_scope(self):
+        # A non-ASCII byte in a workflow breaks cp1252 yaml loads (regen-on-main.yml,
+        # 2026-10-15), so .github/workflows/*.yml is held to the same ratchet.
+        self._write(".github/workflows/x.yml", "# a \U0001F422 b\n")
+        findings = el.ascii_findings(self.root)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("U+1F422", findings[0]["message"])
+
+    def test_nested_workflow_yaml_is_out_of_scope(self):
+        self._write(".github/workflows/sub/y.yml", "# a — b\n")
+        self.assertEqual(el.ascii_findings(self.root), [])
+
     def test_baselined_non_ascii_file_is_allowed(self):
         self._write("tools/x.py", "# a — b\n")
         self._baseline({"tools/x.py": 1})
@@ -679,6 +694,73 @@ class AsciiScopeTest(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def _count_baseline(self, counts):
+        (self.root / "tools" / "encoding-ascii-baseline.json").write_text(
+            json.dumps({"files": counts}), encoding="utf-8")
+
+    def test_list_shape_exempts_whole_file_regardless_of_count(self):
+        # Shape 1 (today's behaviour, unchanged): a listed file may hold any
+        # number of non-ASCII characters.
+        self._write("tools/x.py", "# — → — → —\n")
+        self._baseline(["tools/x.py"])
+        self.assertEqual(el.ascii_findings(self.root), [])
+
+    def test_count_baseline_allows_count_at_ceiling(self):
+        self._write("tools/x.py", "# — →\n")
+        self._count_baseline({"tools/x.py": 2})
+        self.assertEqual(el.ascii_findings(self.root), [])
+
+    def test_count_baseline_blocks_a_count_rise(self):
+        self._write("tools/x.py", "# — →\n")
+        self._count_baseline({"tools/x.py": 1})
+        findings = el.ascii_findings(self.root)
+        self.assertTrue(findings, "a count rise above the baselined count must be a finding")
+        self.assertTrue(any("allows 1" in f["message"] for f in findings), findings)
+
+    def test_count_baseline_allows_a_count_fall(self):
+        self._write("tools/x.py", "# —\n")
+        self._count_baseline({"tools/x.py": 3})
+        self.assertEqual(el.ascii_findings(self.root), [])
+
+    def test_count_baseline_file_absent_from_baseline_allows_zero(self):
+        self._write("tools/x.py", "# —\n")
+        self._count_baseline({"tools/other.py": 5})
+        findings = el.ascii_findings(self.root)
+        self.assertTrue(findings, "a file absent from a count baseline allows zero non-ASCII")
+        self.assertTrue(any(f["file"].endswith("x.py") for f in findings), findings)
+
+    def test_count_baseline_zero_for_clean_file_is_a_stale_entry(self):
+        self._write("tools/x.py", "print('clean')\n")
+        self._count_baseline({"tools/x.py": 0})
+        findings = el.ascii_findings(self.root)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("remove", findings[0]["message"])
+
+    def test_unknown_baseline_shape_is_rejected_with_the_existing_error(self):
+        self._write("tools/x.py", "print('clean')\n")
+        for bad in ({"files": 5}, {"files": "tools/x.py"}, ["tools/x.py"]):
+            with self.subTest(bad=bad):
+                (self.root / "tools" / "encoding-ascii-baseline.json").write_text(
+                    json.dumps(bad), encoding="utf-8")
+                with self.assertRaises(ValueError) as ctx:
+                    el.ascii_findings(self.root)
+                self.assertIn('expected {"files": [str, ...]}', str(ctx.exception))
+
+    def test_count_baseline_rejects_bad_counts_fail_closed(self):
+        self._write("tools/x.py", "print('clean')\n")
+        for bad in ({"tools/x.py": -1}, {"tools/x.py": True}, {"tools/x.py": 1.5}):
+            with self.subTest(bad=bad):
+                self._count_baseline(bad)
+                with self.assertRaises(ValueError):
+                    el.ascii_findings(self.root)
+
+    def test_count_baseline_rejects_duplicate_keys_fail_closed(self):
+        self._write("tools/x.py", "# —\n")
+        (self.root / "tools" / "encoding-ascii-baseline.json").write_text(
+            '{"files": {"tools/x.py": 1, "tools/x.py": 9}}', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            el.ascii_findings(self.root)
 
     def _baseline_query(self, baseline_path):
         return subprocess.run(

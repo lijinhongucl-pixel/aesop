@@ -1,5 +1,10 @@
 {
   "files": {
+    ".github/workflows/ci.yml": 10,
+    ".github/workflows/crossos-drift.yml": 3,
+    ".github/workflows/main-full.yml": 3,
+    ".github/workflows/publish.yml": 4,
+    ".github/workflows/reproduce.yml": 2,
     "tools/alert_bridge.py": 10,
     "tools/audit_report.py": 1,
     "tools/auto_merge.py": 2,

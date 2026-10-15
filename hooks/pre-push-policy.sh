@@ -147,8 +147,45 @@ gate_tool_missing_block() {
   printf 'A gate that cannot run must not report success. Push blocked.\n' >&2
 }
 
+# Trunk ref on origin: origin/HEAD's target, else origin/main, else origin/master.
+# Prints the ref and returns 0; prints nothing and returns 1 when origin has no trunk
+# yet (a fresh remote), which is the BOOTSTRAP condition.
+gate_trunk_ref() {
+  local head_ref name
+  head_ref=$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || head_ref=""
+  if [ -n "$head_ref" ]; then
+    name="origin/${head_ref#refs/remotes/origin/}"
+    if git rev-parse --verify -q "$name^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  fi
+  for name in origin/main origin/master; do
+    if git rev-parse --verify -q "$name^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Artifacts a bootstrap push must find committed at HEAD (the hook reads them).
+GATE_BOOTSTRAP_REQUIRED="tools/INDEX.md .pyflakes-baseline.json .subprocess-guard-baseline.json"
+
+# The regenerate command for a push-gate artifact (same strings scaffold and doctor print).
+gate_regen_command() {
+  case "$1" in
+    tools/INDEX.md) printf '%s' "python tools/gen_tool_index.py --regenerate" ;;
+    .pyflakes-baseline.json) printf '%s' "python tools/pyflakes_gate.py --root . --baseline .pyflakes-baseline.json --update-baseline" ;;
+    .subprocess-guard-baseline.json) printf '%s' "python tools/subprocess_guard.py --baseline .subprocess-guard-baseline.json --update-baseline" ;;
+    .portability-baseline.json) printf '%s' "python tools/portability_check.py --root . --baseline .portability-baseline.json --update-baseline" ;;
+    .stateapi-baseline.json) printf '%s' "python tools/stateapi_lint.py --root . --baseline .stateapi-baseline.json --update-baseline" ;;
+    *) printf '%s' "see tools/doctor.js" ;;
+  esac
+}
+
 gate_base_dir() {
-  # Prints a directory holding origin/main's tools/ and .pyflakes-baseline.json:
+  # Prints a directory holding the trunk's tools/ and .pyflakes-baseline.json:
   # the BASE gate copies. Every gate script this hook runs comes from here, never
   # from the pushed tree, so a branch that weakens a gate cannot judge its own
   # push (F-04 / adv-enforcement F-03). Gate DATA roots (--root) still point at
@@ -161,12 +198,26 @@ gate_base_dir() {
   # Every root package the base gates import is extracted: tools/ always, and
   # state_store/ whenever origin/main carries it (state_store/ itself imports
   # tools.*, which the same archive already provides).
-  # Fail-closed: prints nothing and returns 1 when origin/main cannot be read.
-  local base_sha tmp_root dir staging roots="" root
-  base_sha=$(git rev-parse --verify -q "origin/main^{commit}" 2>/dev/null) || return 1
+  # The base is the trunk on origin (gate_trunk_ref), never a hardcoded name. On a
+  # fresh remote with no trunk yet, the base is HEAD (BOOTSTRAP): every gate copy and
+  # baseline then comes from the local committed tree, and every bootstrap-required
+  # artifact must be committed at HEAD or the function fails closed, naming it.
+  # Fail-closed: prints nothing and returns 1 when the base cannot be read.
+  local base_ref base_sha tmp_root dir staging roots="" root f
+  if base_ref=$(gate_trunk_ref); then
+    base_sha=$(git rev-parse --verify -q "$base_ref^{commit}" 2>/dev/null) || return 1
+  else
+    base_sha=$(git rev-parse --verify -q "HEAD^{commit}" 2>/dev/null) || return 1
+    for f in $GATE_BOOTSTRAP_REQUIRED; do
+      if ! git cat-file -e "$base_sha:$f" 2>/dev/null; then
+        printf 'FATAL: BOOTSTRAP (no trunk on origin: checked origin/HEAD, origin/main, origin/master): %s is not committed at HEAD. Push blocked (fail-closed).\n  Regenerate with: %s\n  then commit it before pushing.\n' "$f" "$(gate_regen_command "$f")" >&2
+        return 1
+      fi
+    done
+  fi
   [ -n "$base_sha" ] || return 1
   tmp_root="${TMPDIR:-/tmp}"
-  dir="$tmp_root/aesop-gate-base-v2-$base_sha"
+  dir="$tmp_root/aesop-gate-base-v3-$base_sha"
   if [ ! -f "$dir/.complete" ]; then
     for root in tools state_store; do
       if git cat-file -e "$base_sha:$root" 2>/dev/null; then
@@ -179,6 +230,10 @@ gate_base_dir() {
       rm -rf "$staging"
       return 1
     fi
+    # git records tools/*.py as 100644, and POSIX `[ -x ]` (check_secret_scan) then rejects the
+    # scanner on Linux. The base copy is private to this hook and content-addressed, so its
+    # gate scripts are made executable here; the -x check itself is unchanged.
+    find "$staging/tools" -maxdepth 1 -name '*.py' -exec chmod +x {} + 2>/dev/null
     if git cat-file -e "$base_sha:.pyflakes-baseline.json" 2>/dev/null; then
       if ! git show "$base_sha:.pyflakes-baseline.json" > "$staging/.pyflakes-baseline.json" 2>/dev/null; then
         rm -rf "$staging"
@@ -197,7 +252,7 @@ gate_base_block() {
   # Shared fail-closed message: the base gate copy cannot be read, so no gate can judge the push.
   local label="$1"
   log_block "gate_base_unavailable"
-  printf 'FATAL: %s cannot run its base gate copy: origin/main:tools is unreadable. Push blocked (fail-closed).\n' "$label" >&2
+  printf 'FATAL: %s cannot run its base gate copy: the trunk (or HEAD in BOOTSTRAP) tools/ is unreadable. Push blocked (fail-closed).\n' "$label" >&2
 }
 
 check_gate_tamper() {
@@ -210,7 +265,7 @@ check_gate_tamper() {
     [ -z "$local_sha" ] && continue
     [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
     changed=$(git diff --name-only "origin/main...$local_sha" 2>/dev/null) || changed=""
-    hits+=$(printf '%s\n' "$changed" | grep -E '^(tools/[^/]*gate[^/]*\.py|tools/secret_scan\.py|hooks/pre-push-policy\.sh|\.github/workflows/)' || true)
+    hits+=$(printf '%s\n' "$changed" | grep -E '^(tools/[^/]*gate[^/]*\.py|tools/secret_scan\.py|tools/gen_[^/]*\.py|tools/generated_[^/]*\.py|hooks/pre-push-policy\.sh|\.github/workflows/)' || true)
     hits+=$'\n'
   done <<< "$tuples"
   hits=$(printf '%s\n' "$hits" | sed '/^$/d' | sort -u)
@@ -932,26 +987,28 @@ check_conflict_markers() {
 }
 
 check_symbol_survival() {
+  local gate_dir
+  gate_dir=$(gate_base_dir) || { gate_base_block "check_symbol_survival"; return 1; }
   # PR symbol survival gate (Guardrail G13, tools/pr_symbol_survival_check.py).
+  # The script runs from the BASE gate copy (gate_base_dir), never the pushed tree,
+  # so a push cannot stub its own symbol gate to pass.
   # BLOCKING since the G13 promotion: a symbol the pushed branch added that a
   # merge commit in range dropped (conflict-resolution loss, PR #745 class)
   # fails the push. Exit 1 = symbols missing; exit 2 = tool/git error. Both
   # block. Same range mechanism as check_conflict_markers (one remote..local
   # range per ref tuple from get_commit_range()).
   #
-  # Fail-open ONLY when there is no aesop tools/ checkout at all (the same
-  # rule as every other gate); a present-but-missing script fails closed.
-  local aesop_root
-  aesop_root=$(resolve_aesop_root)
-  local symbol_script="$aesop_root/tools/pr_symbol_survival_check.py"
+  # Fail-closed: the base copy's tools/ always exists (gate_base_dir), so a missing
+  # script in it blocks the push. There is no skip branch here: skipping on a pushed
+  # tools/ deletion would reopen the bypass this function closes.
+  # Base-pinned (same rule as every other gate): the tool runs from the origin/main
+  # gate copy, never the pushed tree. A PR that weakens the tool to exit 0 must not
+  # pass a lossy merge it is judged on (lens L2 F2, G13 not base-pinned).
+  local symbol_script="$gate_dir/tools/pr_symbol_survival_check.py"
 
   local tool_status
-  tool_status=$(gate_tool_status "$aesop_root" "$symbol_script")
-  if [ "$tool_status" = "skip" ]; then
-    log_event "symbol_survival_skipped_no_aesop_tools"
-    return 0
-  fi
-  if [ "$tool_status" = "missing" ]; then
+  tool_status=$(gate_tool_status "$gate_dir" "$symbol_script")
+  if [ "$tool_status" != "ok" ]; then
     gate_tool_missing_block "pr_symbol_survival_check.py" "$symbol_script"
     log_event "symbol_survival_tool_missing"
     return 1
@@ -1295,7 +1352,18 @@ check_subprocess_guard_ratchet() {
   fi
 
   local baseline="$aesop_root/.subprocess-guard-baseline.json"
-  if [ ! -f "$baseline" ]; then
+  local baseline_arg=".subprocess-guard-baseline.json" head_copy=""
+  if ! gate_trunk_ref >/dev/null 2>&1; then
+    # BOOTSTRAP (no trunk on origin): judge against the committed HEAD copy, never the working tree.
+    head_copy=$(mktemp "${TMPDIR:-/tmp}/aesop-sg-baseline.XXXXXX" 2>/dev/null) || head_copy=""
+    if [ -z "$head_copy" ] || ! git show "HEAD:.subprocess-guard-baseline.json" > "$head_copy" 2>/dev/null; then
+      [ -n "$head_copy" ] && rm -f "$head_copy"
+      printf 'FATAL: .subprocess-guard-baseline.json is not committed at HEAD (BOOTSTRAP). Push blocked (fail-closed).\n  Regenerate with: %s\n  then commit it before pushing.\n' "$(gate_regen_command .subprocess-guard-baseline.json)" >&2
+      log_event "subprocess_guard_ratchet_baseline_missing"
+      return 1
+    fi
+    baseline_arg="$head_copy"
+  elif [ ! -f "$baseline" ]; then
     printf 'FATAL: .subprocess-guard-baseline.json not found at %s. A ratchet with no baseline cannot judge the push (fail-closed).\n' "$baseline" >&2
     log_event "subprocess_guard_ratchet_baseline_missing"
     return 1
@@ -1303,14 +1371,16 @@ check_subprocess_guard_ratchet() {
 
   local py_bin=""
   if ! py_bin=$(resolve_py_bin); then
+    [ -n "$head_copy" ] && rm -f "$head_copy"
     gate_no_python_block "subprocess guard ratchet"
     log_event "subprocess_guard_ratchet_no_python"
     return 1
   fi
 
   local sg_output
-  sg_output=$(cd "$aesop_root" && "$py_bin" tools/subprocess_guard.py --check --baseline .subprocess-guard-baseline.json 2>&1)
+  sg_output=$(cd "$aesop_root" && "$py_bin" tools/subprocess_guard.py --check --baseline "$baseline_arg" 2>&1)
   local sg_exit_code=$?
+  [ -n "$head_copy" ] && rm -f "$head_copy"
   if [ $sg_exit_code -eq 0 ]; then
     return 0
   fi
@@ -1774,7 +1844,7 @@ check_generated_regen() {
   fi
 
   local gate_output
-  gate_output=$("$py_bin" "$gate_script" "${range_args[@]}" 2>&1)
+  gate_output=$("$py_bin" "$gate_script" --base-dir "$gate_dir" "${range_args[@]}" 2>&1)
   local gate_exit_code=$?
   if [ $gate_exit_code -ne 0 ]; then
     if [ -n "$gate_output" ]; then
@@ -1786,6 +1856,8 @@ check_generated_regen() {
 }
 
 check_emit_receipt() {
+  local gate_dir
+  gate_dir=$(gate_base_dir) || { gate_base_block "check_emit_receipt"; return 1; }
   # Receipt-gate auto-emission (docs/RECEIPT-GATE.md). Day-1 measurement found
   # 41 merged PRs and ZERO receipts: lanes were never told to run
   # `emit_receipt.py` and nothing ran it automatically, so the honesty signal
@@ -1828,7 +1900,9 @@ check_emit_receipt() {
   # Flush any spooled receipts from prior pushes before emitting a new one.
   # This ensures that once shas are pushed and exist on GitHub, their receipts
   # are published. Fail-open: errors in flushing do not block the push.
-  local flush_script="$aesop_root/tools/receipt_flush.py"
+  # Both this flush and the emitter below run from the BASE gate copy (gate_base_dir);
+  # --repo still names the pushed tree, which is the data being receipted.
+  local flush_script="$gate_dir/tools/receipt_flush.py"
   local py_bin=""
   if [ -f "$flush_script" ]; then
     if py_bin=$(resolve_py_bin); then
@@ -1836,14 +1910,14 @@ check_emit_receipt() {
     fi
   fi
 
-  local receipt_script="$aesop_root/tools/emit_receipt.py"
+  local receipt_script="$gate_dir/tools/emit_receipt.py"
 
   if [ ! -f "$receipt_script" ]; then
-    # Not fail-closed like gate_tool_status's "missing" case: this is not a
-    # verification gate, so a repo without tools/emit_receipt.py (no aesop
-    # checkout, or a branch predating this tool) simply emits nothing.
-    log_event "receipt_emit_skipped_tool_missing"
-    return 0
+    # Fail-closed: the emitter is read from the base copy, and a base copy without it
+    # cannot produce a conclusion to gate on. Blocks the push with a named message.
+    printf 'FATAL: emit_receipt.py not found in the base gate copy (%s). Push blocked (fail-closed).\n' "$receipt_script" >&2
+    log_block "receipt_emit_base_tool_missing"
+    return 1
   fi
 
   local py_bin=""
@@ -1997,9 +2071,9 @@ check_emit_receipt() {
     local spool_sha=""
     spool_sha=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
       git -C "$aesop_root" rev-parse HEAD 2>/dev/null) || spool_sha=""
-    if [ -n "$spool_sha" ] && [ -f "$aesop_root/tools/receipt_autoflush.py" ]; then
+    if [ -n "$spool_sha" ] && [ -f "$gate_dir/tools/receipt_autoflush.py" ]; then
       env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
-        "$py_bin" "$aesop_root/tools/receipt_autoflush.py" --repo "$aesop_root" --sha "$spool_sha" --spawn \
+        "$py_bin" "$gate_dir/tools/receipt_autoflush.py" --repo "$aesop_root" --sha "$spool_sha" --spawn \
         < /dev/null 2>&1 || true
       log_event "receipt_autoflush_spawned"
     fi
@@ -2999,10 +3073,19 @@ GENPATHS
     git -C "$sym_repo" config user.email "test@example.com"
     git -C "$sym_repo" config user.name "Test User"
     git -C "$sym_repo" config core.autocrlf false
+    mkdir -p "$sym_repo/tools"
+    cp "$sym_real_root/tools/pr_symbol_survival_check.py" "$sym_repo/tools/"
     printf 'def existing():\n    pass\n' > "$sym_repo/mod.py"
+    # The G13 tool is base-pinned: the hook runs origin/main's copy, so the trunk must
+    # carry it and origin/main must exist (gate_base_dir fails closed on a bare repo,
+    # which would make the BLOCK assertion pass for the wrong reason).
+    mkdir -p "$sym_repo/tools"
+    cp "$sym_real_root/tools/pr_symbol_survival_check.py" "$sym_repo/tools/"
     git -C "$sym_repo" add -A
     git -C "$sym_repo" commit -q -m base
     sym_base=$(git -C "$sym_repo" rev-parse HEAD)
+    # The trunk on origin carries the real gate: that is the base copy the check runs.
+    git -C "$sym_repo" update-ref refs/remotes/origin/main "$sym_base"
 
     git -C "$sym_repo" checkout -q -b feature
     printf 'def existing():\n    pass\n\n\ndef alpha():\n    pass\n' > "$sym_repo/mod.py"
@@ -3023,10 +3106,15 @@ GENPATHS
       cd "$sym_repo" || exit 1
       export AESOP_ROOT="$sym_aesop_root"
       stdin_line="$sym_tip $sym_tip refs/heads/main $sym_base"
-      if printf '%s\n' "$stdin_line" | check_symbol_survival >/dev/null 2>&1; then
+      sym_block_out=$(printf '%s\n' "$stdin_line" | check_symbol_survival 2>&1)
+      if [ $? -eq 0 ]; then
         printf 'FAIL: check_symbol_survival should BLOCK a push whose merge dropped a branch symbol\n'
         exit 1
       fi
+      case "$sym_block_out" in
+        *MISSING*) ;;
+        *) printf 'FAIL: block did not come from the symbol-survival verdict (no MISSING): %s\n' "$sym_block_out"; exit 1 ;;
+      esac
 
       git checkout -q -b clean "$sym_base"
       printf 'def existing():\n    pass\n\n\ndef beta():\n    pass\n' > mod.py
@@ -3046,12 +3134,159 @@ GENPATHS
     test_failed=$((test_failed + 1))
   fi
 
+  printf '\n=== Test 30: check_symbol_survival runs the BASE tool, not the pushed copy (a pushed always-pass stub cannot pass a lossy merge) ===\n'
+  (
+    sb_real_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    sb_repo="$tmpdir/symbol_base_repo"
+    rm -rf "$sb_repo"
+    git init -q -b main "$sb_repo"
+    git -C "$sb_repo" config user.email "test@example.com"
+    git -C "$sb_repo" config user.name "Test User"
+    git -C "$sb_repo" config core.autocrlf false
+    mkdir -p "$sb_repo/tools"
+    cp "$sb_real_root/tools/pr_symbol_survival_check.py" "$sb_repo/tools/"
+    printf 'def existing():\n    pass\n' > "$sb_repo/mod.py"
+    git -C "$sb_repo" add -A
+    git -C "$sb_repo" commit -q -m base
+    sb_base=$(git -C "$sb_repo" rev-parse HEAD)
+    # origin/main (the trunk) carries the REAL gate: that is the base copy.
+    git -C "$sb_repo" update-ref refs/remotes/origin/main "$sb_base"
+
+    git -C "$sb_repo" checkout -q -b feature
+    printf 'def existing():\n    pass\n\n\ndef alpha():\n    pass\n' > "$sb_repo/mod.py"
+    git -C "$sb_repo" commit -qam "feat: add alpha"
+    git -C "$sb_repo" checkout -q main
+    printf 'def existing():\n    pass\n\n\ndef gamma():\n    pass\n' > "$sb_repo/mod.py"
+    git -C "$sb_repo" commit -qam "main: add gamma"
+    # Lossy merge with main as FIRST parent: resolution keeps main's whole file (drops alpha).
+    git -C "$sb_repo" merge -q --no-edit feature >/dev/null 2>&1 || true
+    git -C "$sb_repo" checkout -q --ours mod.py
+    git -C "$sb_repo" add mod.py
+    git -C "$sb_repo" commit -q -m "merge feature (resolution drops alpha)"
+    # The PUSHED tree stubs the gate to always pass. The base copy must still judge the push.
+    printf 'import sys\nsys.exit(0)\n' > "$sb_repo/tools/pr_symbol_survival_check.py"
+    git -C "$sb_repo" commit -qam "push: stub the symbol gate to always pass"
+    sb_tip=$(git -C "$sb_repo" rev-parse HEAD)
+
+    (
+      cd "$sb_repo" || exit 1
+      unset AESOP_ROOT
+      stdin_line="$sb_tip $sb_tip refs/heads/feature $sb_base"
+      if printf '%s\n' "$stdin_line" | check_symbol_survival >/dev/null 2>&1; then
+        printf 'FAIL: check_symbol_survival ran the pushed always-pass stub; it must run the base copy and BLOCK\n'
+        exit 1
+      fi
+      printf 'PASS: check_symbol_survival ran the base copy and blocked the lossy merge despite the pushed stub\n'
+    )
+  )
+  if [ $? -eq 0 ]; then
+    test_passed=$((test_passed + 1))
+  else
+    test_failed=$((test_failed + 1))
+  fi
+
+  printf '\n=== Test 31: check_symbol_survival fails CLOSED when the base copy of the gate is missing ===\n'
+  (
+    sb_real_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    sbm_repo="$tmpdir/symbol_base_missing_repo"
+    rm -rf "$sbm_repo"
+    git init -q -b main "$sbm_repo"
+    git -C "$sbm_repo" config user.email "test@example.com"
+    git -C "$sbm_repo" config user.name "Test User"
+    git -C "$sbm_repo" config core.autocrlf false
+    mkdir -p "$sbm_repo/tools"
+    printf 'placeholder\n' > "$sbm_repo/tools/other_gate.txt"
+    printf 'def existing():\n    pass\n' > "$sbm_repo/mod.py"
+    git -C "$sbm_repo" add -A
+    git -C "$sbm_repo" commit -q -m base
+    sbm_base=$(git -C "$sbm_repo" rev-parse HEAD)
+    git -C "$sbm_repo" update-ref refs/remotes/origin/main "$sbm_base"
+
+    # The pushed tree ADDS the gate script the trunk never had: no base copy exists to judge it.
+    git -C "$sbm_repo" checkout -q -b feature
+    cp "$sb_real_root/tools/pr_symbol_survival_check.py" "$sbm_repo/tools/"
+    printf 'def existing():\n    pass\n\n\ndef beta():\n    pass\n' > "$sbm_repo/mod.py"
+    git -C "$sbm_repo" add -A
+    git -C "$sbm_repo" commit -q -m "feat: add symbol gate and beta"
+    sbm_tip=$(git -C "$sbm_repo" rev-parse HEAD)
+
+    (
+      cd "$sbm_repo" || exit 1
+      unset AESOP_ROOT
+      stdin_line="$sbm_tip $sbm_tip refs/heads/feature $sbm_base"
+      sbm_out=$(printf '%s\n' "$stdin_line" | check_symbol_survival 2>&1)
+      sbm_rc=$?
+      if [ "$sbm_rc" -eq 0 ]; then
+        printf 'FAIL: check_symbol_survival must fail closed when the base gate copy is missing (rc=0)\n'
+        exit 1
+      fi
+      case "$sbm_out" in
+        *pr_symbol_survival_check.py*) ;;
+        *) printf 'FAIL: missing base gate must name the script in its message; got: %s\n' "$sbm_out"; exit 1 ;;
+      esac
+      printf 'PASS: check_symbol_survival fails closed (rc=%s) and names the missing base gate\n' "$sbm_rc"
+    )
+  )
+  if [ $? -eq 0 ]; then
+    test_passed=$((test_passed + 1))
+  else
+    test_failed=$((test_failed + 1))
+  fi
+
+  printf '\n=== Test 32: check_emit_receipt runs the BASE emit_receipt.py, not a stubbed pushed copy (a RED base matrix blocks) ===\n'
+  (
+    er_repo="$tmpdir/emit_base_repo"
+    rm -rf "$er_repo"
+    git init -q -b main "$er_repo"
+    git -C "$er_repo" config user.email "test@example.com"
+    git -C "$er_repo" config user.name "Test User"
+    git -C "$er_repo" config core.autocrlf false
+    mkdir -p "$er_repo/tools"
+    printf 'import sys\nsys.exit(3)\n' > "$er_repo/tools/emit_receipt.py"
+    printf 'seed\n' > "$er_repo/seed.txt"
+    git -C "$er_repo" add -A
+    git -C "$er_repo" commit -q -m base
+    er_base=$(git -C "$er_repo" rev-parse HEAD)
+    git -C "$er_repo" update-ref refs/remotes/origin/main "$er_base"
+
+    # The PUSHED tree stubs the receipt emitter to always exit 0 (green).
+    git -C "$er_repo" checkout -q -b feature
+    printf 'import sys\nsys.exit(0)\n' > "$er_repo/tools/emit_receipt.py"
+    git -C "$er_repo" commit -qam "push: stub the receipt emitter to always pass"
+
+    # Shim: gh --version must succeed so the check reaches the emitter on any host.
+    er_fakebin="$tmpdir/emit_fakebin"
+    rm -rf "$er_fakebin"
+    mkdir -p "$er_fakebin"
+    printf '#!/bin/sh\nexit 0\n' > "$er_fakebin/gh"
+    chmod +x "$er_fakebin/gh"
+
+    (
+      cd "$er_repo" || exit 1
+      unset AESOP_ROOT
+      export PATH="$er_fakebin:$PATH"
+      export AESOP_RECEIPT_EMIT=1
+      export AESOP_RECEIPT_KEY="test-key-material-not-a-secret"
+      export AESOP_RECEIPT_TIMEOUT=60
+      if check_emit_receipt < /dev/null >/dev/null 2>&1; then
+        printf 'FAIL: check_emit_receipt ran the pushed always-pass stub; it must run the base copy and BLOCK on red\n'
+        exit 1
+      fi
+      printf 'PASS: check_emit_receipt ran the base copy and blocked on its red matrix\n'
+    )
+  )
+  if [ $? -eq 0 ]; then
+    test_passed=$((test_passed + 1))
+  else
+    test_failed=$((test_failed + 1))
+  fi
+
   printf '\n=== Test Results ===\n'
   printf 'PASSED: %d\n' "$test_passed"
   printf 'FAILED: %d\n' "$test_failed"
 
   if [ "$test_failed" -eq 0 ]; then
-    printf '\nAll 29 tests passed.\n'
+    printf '\nAll 32 tests passed.\n'
     return 0
   else
     printf '\nSome tests failed.\n'
@@ -3101,9 +3336,15 @@ main() {
     exit 1
   fi
 
+  # BOOTSTRAP: no trunk on origin yet (fresh remote); the base is HEAD. Printed once per push.
+  if ! gate_trunk_ref >/dev/null 2>&1; then
+    printf 'BOOTSTRAP: no trunk on origin; base = HEAD\n' >&2
+    log_event "bootstrap_base_head"
+  fi
+
   # Base gate copies must be readable before any gate runs (fail-closed; see gate_base_dir).
   if ! gate_base_dir >/dev/null; then
-    printf 'FATAL: origin/main:tools is unreadable, so the base gate copies cannot run. Push blocked (fail-closed).\n' >&2
+    printf 'FATAL: the base gate copies cannot run (trunk or HEAD tools/ unreadable). Push blocked (fail-closed).\n' >&2
     log_block "gate_base_unavailable"
     exit 1
   fi

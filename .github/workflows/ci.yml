@@ -45,11 +45,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 jobs:
   docs-only-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -71,7 +74,7 @@ jobs:
 
       - name: Setup Python
         if: steps.is-docs-only.outputs.is_docs_only == 'true'
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
 
@@ -95,7 +98,7 @@ jobs:
   windows-sensitive-paths:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -157,7 +160,7 @@ jobs:
       matrix:
         python-shard: [0, 1, 2, 3]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           # On pull_request, check out the PR HEAD commit (not the merge commit).
@@ -167,13 +170,13 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
           cache: npm
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
           cache: pip
@@ -184,7 +187,11 @@ jobs:
         # pytest is required by tests/test_seam_s_e2e_oracle.py subprocess tests.
         # pyflakes is a dev-only lint dependency for tools/pyflakes_gate.py
         # (Guardrail G15, shard 0 only) -- never a runtime dependency of aesop.
-        run: pip install pyyaml pytest pyflakes
+        # cryptography (pinned) runs the verify-receipt base-keyring guard
+        # (tests/test_verify_receipt_base_trust.py). Without it that class is
+        # not run at all, so it is installed on every shard and the guard FAILS
+        # under CI if it is ever missing (lens L2 F1).
+        run: pip install pyyaml pytest pyflakes cryptography==50.0.2
 
       - name: Set shard-specific temporary directory
         run: |
@@ -435,19 +442,19 @@ jobs:
       matrix:
         python-shard: [0, 1, 2, 3]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # On pull_request, check out the PR HEAD commit (not the merge commit).
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
           cache: npm
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
           cache: pip
@@ -458,7 +465,9 @@ jobs:
         # cases run on whichever shard ci_shard_runner.py round-robins them
         # to, so it must be installed here too, not just in the ubuntu
         # shard-0 job that runs the gate itself.
-        run: pip install pyyaml pytest pytest-timeout pyflakes
+        # cryptography (pinned): runs the verify-receipt base-keyring guard on this
+        # shard too (see the ubuntu ci job); a missing dependency fails under CI.
+        run: pip install pyyaml pytest pytest-timeout pyflakes cryptography==50.0.2
 
       - name: Set shard-specific temporary directory
         run: |
@@ -533,7 +542,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Check PowerShell syntax
         shell: powershell
@@ -550,16 +559,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
           cache: npm
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
           cache: pip
@@ -571,7 +580,7 @@ jobs:
           npm run build
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('**/package.json') }}
@@ -638,10 +647,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
 
@@ -663,12 +672,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
 
@@ -687,21 +696,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
 
-      - name: Run pr_symbol_survival_check.py (blocking, G13)
+      # G13 is base-pinned (same as F-04 for the secret scanner, hooks/pre-push-policy.sh
+      # check_symbol_survival): the tool comes from the BASE branch, never the PR tree, so a
+      # PR cannot weaken the gate that judges its own merge.
+      # The BASE tree is a separate checkout at path base/ (same shape as verify-receipt.yml),
+      # so the invocation is a literal base/tools/... path that both the wiring check and the
+      # runability check resolve. A quoted or $VAR path is invisible to verify_gates_wired.py.
+      - name: Checkout the BASE tree (G13 tool source of trust)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run pr_symbol_survival_check.py (blocking, G13, base copy)
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
         run: |
           # Blocking: rc is propagated. Output goes to the job log AND the step summary.
+          test -f base/tools/pr_symbol_survival_check.py
           out="$RUNNER_TEMP/g13-check.txt"
           rc=0
-          python tools/pr_symbol_survival_check.py --base "origin/${{ github.base_ref }}" --head HEAD > "$out" 2>&1 || rc=$?
+          python base/tools/pr_symbol_survival_check.py --base "$BASE_REF" --head HEAD > "$out" 2>&1 || rc=$?
           cat "$out"
           {
             echo "### PR symbol survival check (Guardrail G13, blocking)"
@@ -721,12 +747,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
 
