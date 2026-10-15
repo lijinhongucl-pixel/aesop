@@ -32,7 +32,7 @@ Local-only Python (stdlib only, no external deps), bash (POSIX, CRLF-safe).
 
 - **Worktree .git handling**: `resolve_real_git_dir()` detects when `.git` is a FILE (worktree case) and uses `git rev-parse --git-common-dir` to locate the actual git directory.
 - **Fallback git dir resolution**: Manual parsing of `.git` file's `gitdir:` pointer if git command fails. Every branch returns `Path(...).resolve()` (8.3 TEMP alias `RUNNER~1` / subst drives differ from raw paths).
-- **Hook installation**: `install_pre_push_hook()` uses resolved git dir to place hooks in the common directory (not worktree), preventing ENOTDIR errors in worktree scenarios.
+- **Hook installation**: `install_pre_push_hook()` uses resolved git dir to place hooks in the common directory (not worktree), preventing ENOTDIR errors in worktree scenarios. Hooks dir is resolved by `common.resolve_hooks_dir` (git `--git-path hooks`, honours worktrees + core.hooksPath); health_score FAILs on git error (tests: `tests/test_health_score.py::TestHealthScoreHooksDirResolution`).
 - **Security**: symlink checks preserved throughout resolution.
 - **state/ git-ignore (F-10, 2026-10-14)**: `ensure_state_gitignore()` appends a marker-delimited block (`state/*` + `!state/.gitkeep`) to the scaffolded `.gitignore`, idempotent on re-init. Without it `git add -A` staged the SQLite event store and tracker json. Tests: `tests/test_init_gitignore.py`.
 
