@@ -96,7 +96,7 @@ under the marker `<!-- aesop-receipt:verify-receipt-local -->`. The Action reads
 
 Canonical form: `json.dumps(receipt, sort_keys=True, separators=(",", ":"))`. The
 signature covers the canonical bytes, so changing **any** field (an exit code, the tree,
-the base) invalidates it. The optional `schema_version` field (default: absent, treated as version 1 for backward compatibility) enables forward-compatible extensions without breaking existing verifiers. The optional `profile` field (default: absent, treated as "scoped" for backward compatibility) records which profile was used to select the matrix.
+the base) invalidates it. The optional `schema_version` field (default: absent, treated as version 1 for backward compatibility) enables forward-compatible extensions without breaking existing verifiers. The `profile` field (`"full"` or `"scoped"`) records which profile selected the matrix, and a receipt without a valid profile is INVALID; a `scoped` receipt also declares `shards` and `changed_files`, which the verifier recomputes from the PR diff against origin/main and must match exactly (any file outside the `tests/test_*.py` shard mapping forces `full`).
 
 ## Matrix profiles: default scoped, full available
 
@@ -108,6 +108,7 @@ The scoped profile is the default because the full matrix (`py-shard-0..3`) can 
 - **Full:** `AESOP_RECEIPT_PROFILE=full`. Run fast parts + all shards (today's behavior). Available for explicit measurement or CI runs; set on the command line when you want the old behavior.
 - **Manual override:** `python tools/emit_receipt.py --matrix py-shard-0,secret-scan --post` always respects an explicit `--matrix` argument regardless of profile.
 - **Underivable mapping:** If the shard assignment cannot be determined (e.g., `git ls-files` fails), the profile falls back to `full` to stay safe.
+- **Scoped verification:** the hosted verifier accepts a `scoped` receipt only if it recomputes, from `git diff <origin/main>...<head>`, that every changed file is a mapped `tests/test_*.py` and that the declared shards equal the owning shards and every one of them exited 0; any unmapped file (tools, hooks, workflows, docs, CLAUDE.md), an empty diff, or an unrecomputable scope is INVALID and requires `profile=full`.
 
 Default matrix: `py-shard-0..3` (`tools/ci_shard_runner.py n 4`) plus the pre-push gate
 set, with scoping applied per the profile above. Parts that cannot run on a dev box

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline verifier for a signed local receipt (the hosted side of the receipt gate).
-INDEX: Receipt-gate increment 2 -- offline verifier used by `.github/workflows/verify-receipt.yml`: input is a receipt envelope (`--receipt FILE|-`, as posted by `emit_receipt.py`) plus the head sha of ITS OWN checkout (`--head`, default HEAD); it RECOMPUTES `git rev-parse <head>^{tree}` and compares to the receipt's tree_hash (never trusts the lane's number), verifies the signature (Ed25519 against the committed `tools/receipt_pubkey.pub`, or HMAC-SHA256 against `$AESOP_RECEIPT_HMAC_SECRET`), validates `schema_version` (reject if >1; legacy receipts without it still verify for backward compatibility), checks freshness (receipt.base_sha must be an ancestor of `--main-ref` (origin/main) and at most `--max-behind` (50) commits behind its tip), and requires every REQUIRED part (`--required a,b` ; default py-shard-0..3) present with exit_code 0. Exit 0 = valid, 1 = INVALID (any check failed), 2 = cannot evaluate (unreadable/malformed envelope, no key material for the scheme, git failure) -- fail-closed, never exit 0 on doubt. Also exposes `extract_receipt_from_check_runs()` / `extract_receipt_from_comments()`, and a `--fetch-for-head SHA --repo-slug OWNER/REPO` CLI mode (`fetch_receipt_for_head()`) that the Action's fetch step uses to look up a receipt via `gh api`: FAIL-CLOSED on a missing receipt: no receipt found (or a lookup problem: gh api error, malformed payload) prints `MISSING receipt: ...` and exits 1; a missing `--receipt` file or a payload with no receipt exits 1 the same way. Exit 2 stays for present-but-unevaluable. Lookup never raises. stdlib-only; `cryptography` optional (needed for ed25519 receipts).
+INDEX: Receipt-gate increment 2 -- offline verifier used by `.github/workflows/verify-receipt.yml`: input is a receipt envelope (`--receipt FILE|-`, as posted by `emit_receipt.py`) plus the head sha of ITS OWN checkout (`--head`, default HEAD); it RECOMPUTES `git rev-parse <head>^{tree}` and compares to the receipt's tree_hash (never trusts the lane's number), verifies the signature (Ed25519 against the committed `tools/receipt_pubkey.pub`, or HMAC-SHA256 against `$AESOP_RECEIPT_HMAC_SECRET`), validates `schema_version` (reject if >1; legacy receipts without it still verify for backward compatibility), checks freshness (receipt.base_sha must be an ancestor of `--main-ref` (origin/main) and at most `--max-behind` (50) commits behind its tip), and requires every REQUIRED part (`--required a,b` ; default py-shard-0..3) present with exit_code 0. Exit 0 = valid, 1 = INVALID (any check failed), 2 = cannot evaluate (unreadable/malformed envelope, no key material for the scheme, git failure) -- fail-closed, never exit 0 on doubt. Also exposes `extract_receipt_from_check_runs()` / `extract_receipt_from_comments()`, and a `--fetch-for-head SHA --repo-slug OWNER/REPO` CLI mode (`fetch_receipt_for_head()`) that the Action's fetch step uses to look up a receipt via `gh api`: FAIL-CLOSED on a missing receipt: no receipt found (or a lookup problem: gh api error, malformed payload) prints `MISSING receipt: ...` and exits 1; a missing `--receipt` file or a payload with no receipt exits 1 the same way. Exit 2 stays for present-but-unevaluable. Lookup never raises. stdlib-only; `cryptography` optional (needed for ed25519 receipts). Profiles: `full` keeps the required-parts rule above; `scoped` is accepted only when the verifier recomputes from `git diff <origin/main>...<head>` (via emit_receipt's shard mapping) that every changed file is a mapped tests/test_*.py and that the receipt's shards and changed_files match it exactly; any unmapped file, empty diff, missing/unknown profile, or failed recomputation is INVALID (exit 1).
 
 What a PASS proves: the holder of the signing key ran the named parts on a tree whose
 hash equals the one in this checkout, those parts exited 0, and the run was against a
@@ -21,6 +21,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TOOLS_DIR))
 
 import receipt_common as rc  # noqa: E402  (sys.path adjusted above)
+import emit_receipt  # noqa: E402  (shard mapping shared with the emitter: the scoped recompute reuses it)
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
@@ -28,6 +29,41 @@ _FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
 class CannotEvaluate(Exception):
     """Exit-2 class: the verifier cannot reach a verdict (fail-closed)."""
+
+
+def _recompute_scope(repo, main_tip, head_full, receipt):
+    """Scoped profile: recompute, from the PR diff against main, the shards a change requires.
+
+    Returns (required_shards, reasons). The receipt's own `changed_files` and `shards` are only
+    compared against the recomputation, never used as input. Any changed file outside the
+    shard mapping (tools/, hooks/, workflows, docs, CLAUDE.md, shared test helpers) or an empty
+    diff is a reason to reject: those changes require profile=full. Inability to recompute is a
+    reason too (fail closed), reported as INVALID rather than a crash."""
+    reasons = []
+    try:
+        diff = _git_ok(repo, "diff", "--name-only", "--no-renames", main_tip + "..." + head_full)
+    except CannotEvaluate as e:
+        return [], ["scoped: cannot recompute the PR diff against main (%s)" % e]
+    changed = sorted(line.strip() for line in diff.splitlines() if line.strip())
+    shard_map = emit_receipt._build_shard_map(sorted(emit_receipt._PY_SHARDS), repo=repo)
+    if shard_map is None:
+        return [], ["scoped: cannot recompute the test-to-shard map from this checkout"]
+    if not changed:
+        reasons.append("scoped: the PR diff against main is empty; only profile=full is accepted")
+    outside = emit_receipt.unmapped_changed_files(changed, shard_map)
+    if outside:
+        reasons.append("scoped: changed files outside the shard mapping require profile=full: %s"
+                       % ", ".join(outside[:20]))
+    owning = sorted(emit_receipt._find_owning_shards(changed, shard_map) or set())
+    declared_changed = receipt.get("changed_files")
+    if declared_changed != changed:
+        reasons.append("changed_files: receipt declares %r but the PR diff recomputes to %r"
+                       % (declared_changed, changed))
+    declared_shards = receipt.get("shards")
+    if not isinstance(declared_shards, list) or sorted(declared_shards) != owning:
+        reasons.append("shards: receipt declares %r but the changed files require %r"
+                       % (declared_shards, owning))
+    return owning, reasons
 
 
 def _git(repo, *args):
@@ -108,6 +144,14 @@ def verify(envelope, repo, head, main_ref, max_behind, required, pubkey_path, hm
             behind = int(_git_ok(repo, "rev-list", "--count", receipt["base_sha"] + ".." + main_tip))
             if behind > max_behind:
                 reasons.append("base_sha: %d commits behind %s (max %d) -- stale receipt" % (behind, main_ref, max_behind))
+
+        profile = receipt.get("profile")
+        if profile == "scoped":
+            # The shards this change requires are recomputed here, not taken from the receipt.
+            required, scope_reasons = _recompute_scope(repo, main_tip, head_full, receipt)
+            reasons.extend(scope_reasons)
+        elif profile != "full":
+            reasons.append("profile: missing or unknown %r (expected 'full' or 'scoped')" % (profile,))
 
         by_name = {}
         for p in receipt["parts"]:

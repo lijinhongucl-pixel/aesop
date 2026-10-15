@@ -30,6 +30,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TOOLS_DIR))
 
 import receipt_common as rc  # noqa: E402  (sys.path adjusted above)
+import ci_shard_runner  # noqa: E402  (shard distribution: the one the local parts run)
 
 ReceiptError = rc.ReceiptError
 
@@ -97,18 +98,27 @@ def _get_test_files(repo):
         return None
 
 
-def _build_shard_map(shard_names):
-    """Build a map of test file stems to owning shard names. Returns None if unable."""
-    test_files = _get_test_files(Path("."))
+def _build_shard_map(shard_names, repo=None):
+    """Build a map of test file stems to owning shard names. Returns None if unable.
+
+    Uses ci_shard_runner.distribute_shards (round-robin over the sorted tracked test stems),
+    the same distribution the local matrix parts run (`ci_shard_runner.py n 4`, no timing file)."""
+    test_files = _get_test_files(Path(repo) if repo is not None else Path("."))
     if test_files is None:
         return None
 
     shard_map = {}
-    for i, stem in enumerate(test_files):
-        shard_idx = i % 4  # 4 shards; matches distribute_shards round-robin in ci_shard_runner
-        if shard_idx < len(shard_names):
-            shard_map[stem] = shard_names[shard_idx]
+    for shard_idx, name in enumerate(shard_names):
+        for stem in ci_shard_runner.distribute_shards(test_files, shard_idx, len(shard_names)):
+            shard_map[stem] = name
     return shard_map
+
+
+def _is_shard_mapped(file_path, shard_map):
+    """A changed file is shard-mapped only if it is a tests/test_*.py module the shard map owns.
+    Everything else (tools/, hooks/, workflows, docs, CLAUDE.md) is outside the mapping."""
+    path = Path(file_path)
+    return path.suffix == ".py" and path.parent.as_posix() == "tests" and path.stem in shard_map
 
 
 def _find_owning_shards(changed_files, shard_map):
@@ -116,15 +126,12 @@ def _find_owning_shards(changed_files, shard_map):
     if shard_map is None:
         return None  # Underivable
 
-    owning = set()
-    for file_path in changed_files:
-        path = Path(file_path)
-        # Only map test and tools Python files to shards
-        if path.suffix == ".py" and path.parent.name in ("tests", "tools"):
-            stem = path.stem
-            if stem in shard_map:
-                owning.add(shard_map[stem])
-    return owning
+    return {shard_map[Path(f).stem] for f in changed_files if _is_shard_mapped(f, shard_map)}
+
+
+def unmapped_changed_files(changed_files, shard_map):
+    """Changed files outside the shard mapping. Any such file forces profile=full."""
+    return sorted(f for f in changed_files if not _is_shard_mapped(f, shard_map))
 
 
 def _build_parts_and_skipped_for_profile(profile, changed_files, owning_shards, registry):
@@ -365,10 +372,14 @@ def repo_slug(repo):
     return m.group(1) if m else None
 
 
-def build_receipt(repo, parts, skipped, slug=None, main_ref="origin/main", profile="scoped"):
+def build_receipt(repo, parts, skipped, slug=None, main_ref="origin/main", profile="full",
+                  shards=None, changed_files=None):
+    """Envelope receipt dict. A `scoped` receipt also declares the shards it ran and the
+    changed-file list it scoped from; both are signed with the rest. The verifier recomputes
+    both from the PR diff and never trusts them (tools/verify_receipt.py)."""
     repo = Path(repo)
     head = _git(repo, "rev-parse", "HEAD")
-    return {
+    receipt = {
         "schema": 1,
         "schema_version": 1,
         "profile": profile,
@@ -385,6 +396,10 @@ def build_receipt(repo, parts, skipped, slug=None, main_ref="origin/main", profi
         },
         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if profile == "scoped":
+        receipt["shards"] = sorted(shards or [])
+        receipt["changed_files"] = sorted(changed_files or [])
+    return receipt
 
 
 def conclusion_for(parts):
@@ -499,40 +514,42 @@ def main(argv=None, registry=None, gh_runner=None, environ=None):
         profile = _resolve_profile(environ)
         registry = DEFAULT_REGISTRY if registry is None else registry
 
+        shards_run, changed_for_receipt = None, None
         if args.matrix:
-            # Explicit --matrix overrides profile scoping
+            # Explicit --matrix overrides profile scoping. Only the full matrix is a
+            # verifiable profile; any other subset is labelled "custom" (the verifier rejects it).
             names = [n.strip() for n in args.matrix.split(",") if n.strip()]
+            profile = "full" if set(names) == set(DEFAULT_MATRIX) else "custom"
         else:
             # Determine matrix based on profile
             if profile == "scoped":
-                # Get changed files from git diff
+                # Changed files relative to the merge-base with main (--no-renames so a moved
+                # file's old path is seen too; the verifier recomputes this exact list).
                 try:
                     base_sha = _git(repo, "merge-base", "HEAD", args.main_ref)
-                    changed_output = _git(repo, "diff", "--name-only", base_sha + "..HEAD")
+                    changed_output = _git(repo, "diff", "--name-only", "--no-renames", base_sha + "..HEAD")
                     changed_files = [f.strip() for f in changed_output.split("\n") if f.strip()]
                 except ReceiptError:
-                    changed_files = []  # Fallback: no changes detected
+                    changed_files = []  # Unknown diff: fail closed to the full matrix below
 
-                # Build shard map and find owning shards
-                shard_map = _build_shard_map(sorted(_PY_SHARDS))
-                if shard_map is None:
-                    # Underivable mapping: fall back to full matrix
+                shard_map = _build_shard_map(sorted(_PY_SHARDS), repo=repo)
+                owning_shards = _find_owning_shards(changed_files, shard_map) if shard_map is not None else None
+                if (not changed_files or owning_shards is None
+                        or unmapped_changed_files(changed_files, shard_map)):
+                    # Empty, underivable, or any file outside the shard mapping: full matrix, full profile.
                     names = list(DEFAULT_MATRIX)
+                    profile = "full"
                 else:
-                    owning_shards = _find_owning_shards(changed_files, shard_map)
-                    if owning_shards is None:
-                        # Underivable: fall back to full
-                        names = list(DEFAULT_MATRIX)
-                    else:
-                        # Build scoped matrix
-                        names, skipped_infos = _build_parts_and_skipped_for_profile(
-                            profile, changed_files, owning_shards, registry
-                        )
+                    names, _skipped_infos = _build_parts_and_skipped_for_profile(
+                        profile, changed_files, owning_shards, registry
+                    )
+                    shards_run, changed_for_receipt = sorted(owning_shards), changed_files
             else:  # full
                 names = list(DEFAULT_MATRIX)
 
         parts, skipped = run_matrix(repo, names, registry=registry, jobs=args.jobs)
-        receipt = build_receipt(repo, parts, skipped, slug=args.slug, main_ref=args.main_ref, profile=profile)
+        receipt = build_receipt(repo, parts, skipped, slug=args.slug, main_ref=args.main_ref, profile=profile,
+                                shards=shards_run, changed_files=changed_for_receipt)
         sig = rc.sign(rc.canonical_json(receipt), scheme, private_key_path=key_path, hmac_secret=secret)
         envelope = {"receipt": receipt, "sig": sig}
         if args.out:
