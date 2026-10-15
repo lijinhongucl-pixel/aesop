@@ -133,11 +133,11 @@ The 0.7.1 release added a second corollary: a gate that exists is not a gate tha
 
 **NEXT STEPS (post-0.7.2, ranked):**
 - (a) Receipts design: an update-branch merge head has no signer (seen on #970's merge 0e096a94, verify-receipt red, non-required). Either the harness signs after re-running gates, or lanes merge main locally. Decide in receipts-plan increment I1.
-- (b) Repo-wide sys.modules restoration sweep: 55 `del sys.modules[` sites in test_health_score, test_healthcheck, test_orchestration_core, test_serve, test_ui_config. Run after PR #1004 merges.
-- (c) #985 update onto main after #1001 merges.
+- (b) Repo-wide sys.modules restoration sweep: 55 `del sys.modules[` sites in test_health_score, test_healthcheck, test_orchestration_core, test_serve, test_ui_config. Lane dispatched 2026-10-15 15:40Z.
+- (c) DONE: #985 MERGED, #1001 MERGED (bound 15:38Z).
 - (d) Brain auto-commit hook has no quiet period, so lane fixes land as trailer-less fragments. Decide per-path debounce or claim-aware skip.
-- (e) rotate_logs.py tail semantics now fixed (claude-scripts #44).
-- (f) AUDIT-PRIMER duplicate field reconciled (done in the v0.9.2 checkpoint PR; primer committed in conductor3 34b245d).
+- (e) DONE: rotate_logs.py tail semantics fixed (claude-scripts #44). (f) DONE: AUDIT-PRIMER duplicate field reconciled (conductor3 34b245d).
+- (g) After #1040 merges: resolve the three promoted verify-receipt escapes (runs 38758017891, 38756947479, 38756827874) with `detect_red_ci_runs.py --resolve` citing #1040 (claude-scripts #52 added the flag, 5a49e2f).
 
 
 ### Shipped (Most Recent)
