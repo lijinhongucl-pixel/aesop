@@ -133,7 +133,7 @@ The 0.7.1 release added a second corollary: a gate that exists is not a gate tha
 
 **NEXT STEPS (post-0.7.2, ranked):**
 - (a) Receipts design: an update-branch merge head has no signer (seen on #970's merge 0e096a94, verify-receipt red, non-required). Either the harness signs after re-running gates, or lanes merge main locally. Decide in receipts-plan increment I1.
-- (b) Repo-wide sys.modules restoration sweep: 55 `del sys.modules[` sites in test_health_score, test_healthcheck, test_orchestration_core, test_serve, test_ui_config. Lane dispatched 2026-10-15 15:40Z.
+- (b) DONE by #1022 (573b7db3): tests/sys_modules_restore.py snapshot helper + repo-wide AST guard in tests/test_test_hygiene.py; lane audit 15:45Z found 46 real deletes, 0 unprotected, guard 12 passed. Stale worktree aesop-wt-sysmodules (clean, at 7ee4aa7c) left for the no-delete rule; remove at the next worktree sweep.
 - (c) DONE: #985 MERGED, #1001 MERGED (bound 15:38Z).
 - (d) Brain auto-commit hook has no quiet period, so lane fixes land as trailer-less fragments. Decide per-path debounce or claim-aware skip.
 - (e) DONE: rotate_logs.py tail semantics fixed (claude-scripts #44). (f) DONE: AUDIT-PRIMER duplicate field reconciled (conductor3 34b245d).
