@@ -32,6 +32,7 @@ Local-only Python (stdlib only, no external deps), bash (POSIX, CRLF-safe).
 - **Hook installation**: `install_pre_push_hook()` uses resolved git dir to place hooks in the common directory (not worktree), preventing ENOTDIR errors in worktree scenarios. Hooks dir is resolved by `common.resolve_hooks_dir` (git `--git-path hooks`, honours worktrees + core.hooksPath); health_score FAILs on git error (tests: `tests/test_health_score.py::TestHealthScoreHooksDirResolution`).
 - **Security**: symlink checks preserved throughout resolution.
 - **state/ git-ignore (F-10, 2026-10-14)**: `ensure_state_gitignore()` appends a marker-delimited block (`state/*` + `!state/.gitkeep`) to the scaffolded `.gitignore`, idempotent on re-init. Without it `git add -A` staged the SQLite event store and tracker json. Tests: `tests/test_init_gitignore.py`.
+- **Push-gate artifacts (0.10.1)**: `generate_push_gate_artifacts()` runs the five generators `doctor` requires (`tools/INDEX.md`, `.pyflakes-baseline.json`, `.subprocess-guard-baseline.json`, `.portability-baseline.json`, `.stateapi-baseline.json`) from this tools dir with cwd set to the target repo, in parallel, after the hook install. Existing artifacts are kept unless `--force`; `AESOP_SKIP_PUSH_GATE_ARTIFACTS=1` skips. `DEFAULT_CONFIG` writes `"repos": []`. Tests: `TestInitWritesPushGateArtifacts` in `tests/test_init_project.py`.
 
 ## dash.js — fresh-init resolution (F-09, 2026-10-14)
 
