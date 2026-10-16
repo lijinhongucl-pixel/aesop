@@ -568,5 +568,124 @@ def bad_merge():
             "Test files should not trigger dispatch_lint violations")
 
 
+class TestTightenedDispatchLint(unittest.TestCase):
+    """Behavioural regressions for the three verified dispatch_lint gaps
+    (tracker 75cd331b1686, 4b3485fefc1e, 6a2736a273b8)."""
+
+    @staticmethod
+    def _patterns(content, name="lane.md"):
+        return {v["pattern"] for v in find_violations(Path(name), content)}
+
+    # --- item 1: '#' is only a comment at line start or as a spaced trailing
+    # comment; backtick spans and markdown fences are never exemptions.
+
+    def test_pr_hash_prose_line_is_scanned(self):
+        """`PR #845` is an issue reference, not a comment: the command after it
+        must still be flagged."""
+        content = "Agent()\nLane for PR #845: run gh pr merge 845 --admin now\n"
+        self.assertIn("admin_flag", self._patterns(content))
+
+    def test_inline_backtick_command_in_prose_is_scanned(self):
+        """An inline code span in a dispatch prompt is still an instruction."""
+        content = "Agent()\nLane for PR #845: run `gh pr merge 845 --admin` now\n"
+        self.assertIn("admin_flag", self._patterns(content))
+
+    def test_fenced_block_command_is_scanned(self):
+        """A ```bash fence contains code, not an inline string: its command is
+        scanned (odd backtick parity must not hide it)."""
+        content = "Agent()\n```bash\ngh pr merge 12 --admin\n```\n"
+        self.assertIn("admin_flag", self._patterns(content))
+
+    def test_fence_markers_do_not_hide_later_violations(self):
+        """Fence markers must not flip scanning state for the rest of the file."""
+        content = (
+            "Agent()\n```\nsafe\n```\n\n```\nsafe\n```\n"
+            "gh pr merge 5 --admin\n"
+        )
+        v = find_violations(Path("lane.md"), content)
+        self.assertTrue(any(x["line"] == 9 and x["pattern"] == "admin_flag"
+                            for x in v), v)
+
+    def test_spaced_trailing_comment_still_ignored(self):
+        """A real trailing comment (whitespace, '#', space) is still a comment."""
+        content = "Agent()\ndo_thing()  # gh pr merge 5 --admin\n"
+        self.assertEqual(find_violations(Path("x.py"), content), [])
+
+    # --- item 2: fail closed on missing paths and unreadable files.
+
+    def _run_cli(self, *args):
+        tool = Path(__file__).resolve().parent.parent / "tools" / "dispatch_lint.py"
+        return subprocess.run(
+            [sys.executable, "-I", str(tool), *args],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=120,
+        )
+
+    def test_missing_scan_path_exits_2(self):
+        """The docstring promises exit 2 on error; a missing path is an error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "no_such_path"
+            result = self._run_cli(str(missing), "--check")
+            self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_undecodable_file_is_still_scanned_and_fails(self):
+        """A cp1252 byte must not hide the forbidden command on the same file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad = Path(tmpdir) / "dispatch.md"
+            bad.write_bytes(b"Agent()\ngh pr merge 12\n# caf\xe9\n")
+            result = self._run_cli(tmpdir, "--check")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("gh_pr_merge", result.stdout)
+
+    def test_unreadable_file_fails_closed(self):
+        """A file that cannot be read at all makes main() return 2, not 0."""
+        import builtins
+        import unittest.mock as mock
+        import dispatch_lint
+        with tempfile.TemporaryDirectory() as tmpdir:
+            locked = Path(tmpdir) / "locked.py"
+            locked.write_text("Agent()\n", encoding="utf-8")
+            real_open = builtins.open
+
+            def guarded_open(file, *args, **kwargs):
+                if Path(str(file)).name == "locked.py":
+                    raise PermissionError(13, "denied", str(file))
+                return real_open(file, *args, **kwargs)
+
+            with mock.patch.object(builtins, "open", guarded_open), \
+                    mock.patch.object(sys, "argv", ["dispatch_lint.py", tmpdir, "--check"]):
+                self.assertEqual(dispatch_lint.main(), 2)
+
+    # --- item 3: only a path component named exactly `state` (relative to the
+    # scan root) is skipped; substring matches on ancestors or siblings are not.
+
+    def test_state_store_package_is_scanned(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkg = Path(tmpdir) / "state_store"
+            pkg.mkdir()
+            (pkg / "bad.py").write_text("Agent()\ngh pr merge 1\n", encoding="utf-8")
+            violations_by_file, errors = scan_directory(Path(tmpdir))
+            self.assertEqual(errors, [])
+            self.assertTrue(any(f.endswith("bad.py") for f in violations_by_file),
+                            violations_by_file)
+
+    def test_state_directory_is_still_skipped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir) / "state"
+            d.mkdir()
+            (d / "bad.py").write_text("Agent()\ngh pr merge 1\n", encoding="utf-8")
+            violations_by_file, _ = scan_directory(Path(tmpdir))
+            self.assertEqual(violations_by_file, {})
+
+    def test_ancestor_containing_state_substring_is_scanned(self):
+        """A checkout under e.g. C:/statewide/aesop must not make every file skip."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "statewide"
+            root.mkdir()
+            (root / "bad.py").write_text("Agent()\ngh pr merge 1\n", encoding="utf-8")
+            violations_by_file, _ = scan_directory(root)
+            self.assertTrue(any(f.endswith("bad.py") for f in violations_by_file),
+                            violations_by_file)
+
+
 if __name__ == "__main__":
     unittest.main()
