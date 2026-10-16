@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `tools/goal_state.py` (orchestrator GOAL as append-only `goal_set` events in the event store) and `tools/boot_state.py` (one deterministic, byte-capped boot brief from the store, STATE.md ACTIVE, BUILDLOG tail and git; exits 2 on an unreadable store).
 - Docs: corrected dependency and Python-floor claims to match the repo (no runtime npm dependencies; CI floor Python 3.11; PyYAML/cryptography/playwright/opentelemetry/anthropic/pyflakes listed in new `pyproject.toml`) and added a prompt-injection threat model to `docs/ARCHITECTURE.md`.
+- CI: `.github/shard-timing.json` populated with per-file test counts (a proxy, not measured runtime) so the timing-balanced shard path engages; balanced 4-shard split measured 1674/1673/1673/1673 (was 1607/1583/1520/1983 round-robin) (#1089).
 
 ## [0.10.0] - 2026-10-15
 
