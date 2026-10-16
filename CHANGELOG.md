@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `tools/lane_ab_report.py` (stdlib; reports the lane-contract A/B experiment from `lane-ab.jsonl` and the hook-denial ledger: per-arm dispatches, forced count, denials per dispatch, arm B page-fault relaunches, rules_by_fault_count; exits 2 on unreadable input) and `LANE-CONTRACT-MIN.md` (walls-only arm B brief).
 - CI hardening: every GitHub Actions `uses:` pinned to a full commit SHA with a version comment; top-level `permissions: contents: read` in every workflow, with write grants moved to the jobs that need them; npm pinned to 12.2.0 in publish.yml (the version the last green publish used).
+- Docs: `LANE-CONTRACT.md` §4a item 8 no longer tells lanes to push with `AESOP_RECEIPT_EMIT=0` (interim ended with #924); receipts are emitted on every push. (#1081)
 - Docs: `SECURITY.md` supported-versions table now lists 0.10.x (older lines not supported); `ui/README.md` Python floor and dependency statement aligned with the root README (Python 3.11+).
 - Docs: README adopter step now runs `npx @matt82198/aesop doctor` instead of `npx . doctor` (the scaffold writes no `package.json`, so `npx .` failed with ENOENT) (#1080).
 
