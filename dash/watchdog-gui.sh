@@ -15,10 +15,23 @@ B=$'\e[1m'
 D=$'\e[2m'
 X=$'\e[0m'
 
+# Watchdog heartbeat lives under CONDUCTOR_ROOT, the same location daemons/backup-fleet.sh
+# writes it (never under AESOP_ROOT). Same resolution rule as the daemon: an explicit
+# CONDUCTOR_ROOT always wins; otherwise the sibling conductor3 is derived only when the
+# resolved AESOP_ROOT is the canonical 'aesop' tree. Any other shape gets no heartbeat
+# path, so the watchdog reads STALE (fail closed) instead of a path nothing writes.
+if [ -n "${CONDUCTOR_ROOT:-}" ]; then
+  : # explicit override always wins
+elif [ "$(basename "$(cd "$AESOP_ROOT" 2>/dev/null && pwd -P)")" = "aesop" ]; then
+  CONDUCTOR_ROOT="$(dirname "$(cd "$AESOP_ROOT" && pwd -P)")/conductor3"
+else
+  CONDUCTOR_ROOT=""
+fi
+HB="${CONDUCTOR_ROOT:+$CONDUCTOR_ROOT/state/.watchdog-heartbeat}"
+
 # State files
 BLOG="$AESOP_ROOT/state/FLEET-BACKUP.log"
 SLOG="$AESOP_ROOT/state/SECURITY-ALERTS.log"
-HB="$AESOP_ROOT/state/.watchdog-heartbeat"
 REPOS_FILE="$AESOP_ROOT/state/.watchdog-repos.json"
 HB_DIR="$AESOP_ROOT/state/.heartbeats"
 CONFIG_FILE="$AESOP_ROOT/aesop.config.json"
